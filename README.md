@@ -166,6 +166,11 @@ If a UnityYAML conflict remains, the merge UI opens when a terminal is available
 
 Resolve the remaining conflicts, then select **Complete**.
 
+For array insertion conflicts, focus **Ours** or **Theirs**.
+Press **Shift + T** to switch between **One side** and **Both sides**.
+Use the arrow keys to choose **Ours + Theirs** or **Theirs + Ours**, then press **Enter** to apply that order.
+See [collection merges](docs/collection-merge.md) for supported array behavior and unsupported collection shapes.
+
 ## Development
 
 Install [mise](https://mise.jdx.dev/).

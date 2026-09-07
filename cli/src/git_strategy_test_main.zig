@@ -4,6 +4,7 @@ const t = @import("git_merge_test_main.zig");
 const pty = @import("pty_smoke_test_main.zig");
 const merge_git = @import("merge_git.zig");
 const version = @import("build_options").version;
+const supports_pty = builtin.os.tag == .linux or builtin.os.tag == .macos;
 
 const base = "--- !u!114 &1\nMonoBehaviour:\n  m_Left: 1\n  m_Right: 1\n";
 const ours = "--- !u!114 &1\nMonoBehaviour:\n  m_Left: 2\n  m_Right: 1\n";
@@ -28,7 +29,39 @@ pub fn main(init: std.process.Init) !u8 {
     try t.require(std.mem.eql(u8, strategy_version.stdout, "prefablens merge-strategy " ++ version ++ "\n"), "strategy version command printed the wrong output");
     var env = try init.environ_map.clone(a);
     try env.put("PATH", try std.fmt.allocPrint(a, "{s}{c}{s}{c}{s}", .{ std.fs.path.dirname(prefablens).?, std.fs.path.delimiter, std.fs.path.dirname(strategy_path).?, std.fs.path.delimiter, env.get("PATH") orelse "" }));
-    const ctx: Context = .{ .git = .{ .io = init.io, .arena = a, .env = &env }, .scratch = scratch, .prefablens = prefablens };
+    const ctx: Context = .{ .git = .{ .io = init.io, .arena = a, .env = &env }, .scratch = scratch, .prefablens = prefablens, .fixture_root = args[3] };
+    if (args.len == 5 and std.mem.eql(u8, args[4], "independent-additions")) {
+        try independentAdditions(ctx);
+        return 0;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[4], "clean-renames")) {
+        try cleanRenames(ctx);
+        return 0;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[4], "merge-options")) {
+        try mergeOptions(ctx);
+        try nonInteractive(ctx);
+        return 0;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[4], "encoding")) {
+        try candidateEncoding(ctx);
+        return 0;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[4], "transaction-guards")) {
+        if (supports_pty) try concurrentContent(ctx);
+        try guards(ctx);
+        return 0;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[4], "candidate-safety")) {
+        try addedUnity(ctx);
+        return 0;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[4], "native-fixtures")) {
+        try nativeFixtures(ctx);
+        if (supports_pty) try nativeLocalChoices(ctx);
+        try candidateEncoding(ctx);
+        return 0;
+    }
     try setup(ctx);
     try automatic(ctx);
     try nonInteractive(ctx);
@@ -36,7 +69,12 @@ pub fn main(init: std.process.Init) !u8 {
     try directoryConflict(ctx);
     try mergeOptions(ctx);
     try independentEdits(ctx);
-    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+    try cleanRenames(ctx);
+    try nativeFixtures(ctx);
+    try candidateEncoding(ctx);
+    try addedUnity(ctx);
+    if (supports_pty) {
+        try nativeLocalChoices(ctx);
         try contentPty(ctx);
         try concurrentContent(ctx);
         try privatePermissions(ctx);
@@ -49,6 +87,7 @@ const Context = struct {
     git: merge_git.Git,
     scratch: []const u8,
     prefablens: []const u8,
+    fixture_root: []const u8,
 
     fn repo(self: Context, name: []const u8, files: []const t.FileSides) !merge_git.Git {
         var git = self.git;
@@ -58,6 +97,11 @@ const Context = struct {
         return git;
     }
 };
+
+fn readCollectionFile(ctx: Context, root: []const u8, relative: []const u8) ![]const u8 {
+    const path = try std.fs.path.join(ctx.git.arena, &.{ root, relative });
+    return std.Io.Dir.cwd().readFileAlloc(ctx.git.io, path, ctx.git.arena, .limited(16 * 1024 * 1024));
+}
 
 fn expectFile(git: merge_git.Git, path: []const u8, expected: []const u8) !void {
     try t.expectFile(git.io, git.arena, git.cwd, path, expected);
@@ -239,15 +283,16 @@ fn independentEdits(ctx: Context) !void {
 
 fn concurrentContent(ctx: Context) !void {
     const manual = "--- !u!114 &1\nMonoBehaviour:\n  m_Left: 99\n  m_Right: 1\n";
-    const Change = enum { index, later_file, later_mode };
-    for ([_]Change{ .index, .later_file, .later_mode }) |change| {
-        const later_file = change != .index;
+    const Change = enum { index, source, later_file, later_mode };
+    for ([_]Change{ .index, .source, .later_file, .later_mode }) |change| {
+        const later_file = change == .later_file or change == .later_mode;
         const files = [_]t.FileSides{
             .{ .path = "Assets/A.prefab", .base = base, .ours = ours, .theirs = conflict_theirs },
             .{ .path = "Assets/B.prefab", .base = base, .ours = ours, .theirs = conflict_theirs },
         };
         const git = try ctx.repo(switch (change) {
             .index => "concurrent-index",
+            .source => "concurrent-source",
             .later_file => "later-file-edit",
             .later_mode => "later-mode-edit",
         }, files[0..if (later_file) @as(usize, 2) else 1]);
@@ -257,6 +302,7 @@ fn concurrentContent(ctx: Context) !void {
             .later_file => "cp .git/manual-choice Assets/B.prefab",
             .later_mode => "chmod 0755 Assets/B.prefab",
             .index => try std.fmt.allocPrint(git.arena, "git update-index --cacheinfo 100644,{s},Assets/A.prefab", .{oid}),
+            .source => try std.fmt.allocPrint(git.arena, "git update-index --add --cacheinfo 100644,{s},Assets/Source.cs", .{oid}),
         };
         // Hold the first UI open while another process changes the index or a later file.
         const inner = try std.fmt.allocPrint(git.arena, "(sleep 3; {s}) & exec git merge --no-edit remote", .{edit});
@@ -276,7 +322,7 @@ fn concurrentContent(ctx: Context) !void {
             }
             try t.require((try git.output(&.{ "ls-files", "-u", "--", "Assets/B.prefab" })).len != 0, "manual later file was staged by PrefabLens");
         } else {
-            try t.require(std.mem.eql(u8, manual, try git.output(&.{ "show", ":Assets/A.prefab" })), "Complete overwrote a concurrent index decision");
+            try t.require(std.mem.eql(u8, manual, try git.output(&.{ "show", if (change == .source) ":Assets/Source.cs" else ":Assets/A.prefab" })), "Complete overwrote a concurrent index decision");
             try markers(git, "Assets/A.prefab");
         }
     }
@@ -296,4 +342,187 @@ fn privatePermissions(ctx: Context) !void {
     try expectFile(git, "Assets/B.prefab", ours);
     const stat = try std.Io.Dir.cwd().statFile(git.io, try git.path("Assets/B.prefab"), .{});
     try t.require(stat.permissions.toMode() & 0o777 == 0o600, "content resolution changed private permissions");
+}
+
+fn nativeFixtures(ctx: Context) !void {
+    const Case = struct { name: []const u8, conflict: bool, choice: ?[]const u8 = null };
+    const Manifest = struct { cases: []const Case };
+    const parsed = try std.json.parseFromSlice(Manifest, ctx.git.arena, try readCollectionFile(ctx, ctx.fixture_root, "expected-runtime.json"), .{ .ignore_unknown_fields = true });
+    const script = try readCollectionFile(ctx, ctx.fixture_root, "unity/Assets/AuditBehaviour.cs");
+    const meta = try readCollectionFile(ctx, ctx.fixture_root, "unity/Assets/AuditBehaviour.cs.meta");
+    for (parsed.value.cases) |case| {
+        const root = try std.fs.path.join(ctx.git.arena, &.{ ctx.fixture_root, "cases", case.name });
+        var files: std.ArrayList(t.FileSides) = .empty;
+        var prefab_sides: [3][]const u8 = undefined;
+        for ([_][]const u8{ "base", "ours", "theirs" }, 0..) |side_name, i| {
+            prefab_sides[i] = try readCollectionFile(ctx, root, try std.fmt.allocPrint(ctx.git.arena, "{s}.prefab", .{side_name}));
+        }
+        try files.append(ctx.git.arena, .{ .path = "Assets/Plain.prefab", .base = prefab_sides[0], .ours = prefab_sides[1], .theirs = prefab_sides[2] });
+        try files.append(ctx.git.arena, .{ .path = "Assets/AuditBehaviour.cs", .base = script, .ours = script, .theirs = script });
+        try files.append(ctx.git.arena, .{ .path = "Assets/AuditBehaviour.cs.meta", .base = meta, .ours = meta, .theirs = meta });
+        const git = try ctx.repo(try std.fmt.allocPrint(ctx.git.arena, "native-{s}", .{case.name}), files.items);
+        std.debug.print("native fixture: {s}\n", .{case.name});
+        if (case.conflict) {
+            try t.expectCode(try git.run(&.{ "merge", "--no-commit", "remote" }), 1, "native array fixture retains local choice");
+            try t.require((try git.output(&.{ "ls-files", "--unmerged", "--", "Assets/Plain.prefab" })).len != 0, "native array fixture lost local stages");
+            try git.ok(&.{ "merge", "--abort" });
+            try expectFile(git, "Assets/Plain.prefab", prefab_sides[1]);
+            if (!supports_pty) continue;
+            const keys: []const u8 = if (std.mem.eql(u8, case.choice.?, "ours_first")) "\x1b[CT\r\r" else "\x1b[C\x1b[C\r\r";
+            const command = try std.fmt.allocPrint(git.arena, "env PATH={s} git merge --no-commit remote", .{try t.shellQuote(git.arena, git.env.get("PATH").?)});
+            try t.expectCode(try pty.runCommandInPty(git.io, git.arena, git.cwd, command, keys, 30), 0, "native array fixture local choice");
+        } else try t.expectCode(try git.run(&.{ "merge", "--no-commit", "remote" }), 0, "native automatic array fixture");
+        try expectFile(git, "Assets/Plain.prefab", try readCollectionFile(ctx, root, "expected.prefab"));
+        try t.require((try git.output(&.{ "ls-files", "--unmerged" })).len == 0, "native array fixture retained stages");
+        try git.ok(&.{ "merge", "--abort" });
+        try expectFile(git, "Assets/Plain.prefab", prefab_sides[1]);
+    }
+}
+
+fn nativeLocalChoices(ctx: Context) !void {
+    const prefix = "--- !u!114 &1\nMonoBehaviour:\n";
+    const cases = [_]struct { name: []const u8, base_items: []const u8, ours_items: []const u8, theirs_items: []const u8, expected: []const u8, keys: []const u8 }{
+        .{ .name = "native-ours-first", .base_items = "[A]", .ours_items = "[A, Ours]", .theirs_items = "[A, Theirs]", .expected = "[A, Ours, Theirs]", .keys = "\x1b[CT\r\r" },
+        .{ .name = "native-theirs-first", .base_items = "[A]", .ours_items = "[A, Ours]", .theirs_items = "[A, Theirs]", .expected = "[A, Theirs, Ours]", .keys = "\x1b[CT\x1b[C\r\r" },
+        .{ .name = "native-delete-edit", .base_items = "[A, B, C]", .ours_items = "[A]", .theirs_items = "[A, B, Edited]", .expected = "[A, Edited]", .keys = "\x1b[C\x1b[C\r\r" },
+        .{ .name = "native-custom", .base_items = "[A]", .ours_items = "[A, Ours]", .theirs_items = "[A, Theirs]", .expected = "[A, Custom]", .keys = "\x1b[<0;83;5M[Custom]\r\r" },
+    };
+    for (cases) |case| {
+        const git = try ctx.repo(case.name, &.{.{ .path = "Assets/A.prefab", .base = try std.fmt.allocPrint(ctx.git.arena, prefix ++ "  m_Items: {s}\n  m_Left: 1\n  m_Right: 1\n", .{case.base_items}), .ours = try std.fmt.allocPrint(ctx.git.arena, prefix ++ "  m_Items: {s}\n  m_Left: 2\n  m_Right: 1\n", .{case.ours_items}), .theirs = try std.fmt.allocPrint(ctx.git.arena, prefix ++ "  m_Items: {s}\n  m_Left: 1\n  m_Right: 3\n", .{case.theirs_items}) }});
+        try t.expectCode(try runPty(git, case.keys), 0, "native local collection choice");
+        try expectFile(git, "Assets/A.prefab", try std.fmt.allocPrint(git.arena, prefix ++ "  m_Items: {s}\n  m_Left: 2\n  m_Right: 3\n", .{case.expected}));
+        try t.require((try git.output(&.{ "ls-files", "--unmerged" })).len == 0, "native local choice retained stages");
+    }
+}
+
+fn addedUnity(ctx: Context) !void {
+    const git = try ctx.repo("added-unity", &.{.{ .path = "Assets/Original.prefab", .base = base, .ours = ours, .theirs = theirs }});
+    try git.ok(&.{ "switch", "-q", "remote" });
+    const bytes = "--- !u!114 &1\nMonoBehaviour:\n  values: [A, B]\n";
+    try write(git, "Assets/Added.prefab", bytes);
+    try git.ok(&.{ "add", "--all" });
+    try git.ok(&.{ "commit", "-qm", "add collection asset" });
+    try git.ok(&.{ "switch", "-q", "local" });
+    try t.expectCode(try git.run(&.{ "merge", "--no-commit", "remote" }), 0, "one-sided added Unity asset");
+    try expectFile(git, "Assets/Added.prefab", bytes);
+    try t.require((try git.output(&.{ "ls-files", "--unmerged" })).len == 0, "clean added Unity acquired stages");
+    try git.ok(&.{ "merge", "--abort" });
+}
+
+fn candidateEncoding(ctx: Context) !void {
+    const root = try std.fs.path.join(ctx.git.arena, &.{ ctx.fixture_root, "cases", "array-separate-insert" });
+    const path = if (builtin.os.tag == .windows) "Assets/CRLF.prefab" else "Assets/a\tb\nc.prefab";
+    for ([_]bool{ false, true }) |filtered| {
+        var sides: [3][]const u8 = undefined;
+        for ([_][]const u8{ "base", "ours", "theirs" }, 0..) |name, i| {
+            const bytes = try readCollectionFile(ctx, root, try std.fmt.allocPrint(ctx.git.arena, "{s}.prefab", .{name}));
+            sides[i] = if (filtered)
+                try std.fmt.allocPrint(ctx.git.arena, "{s}# canonical-token\n", .{bytes})
+            else
+                try std.mem.replaceOwned(u8, ctx.git.arena, bytes, "\n", "\r\n");
+        }
+        const git = try ctx.repo(if (filtered) "candidate-filter" else "candidate-crlf-path-mode", &.{.{ .path = path, .base = sides[0], .ours = sides[1], .theirs = sides[2] }});
+        const source_expected = try readCollectionFile(ctx, root, "expected.prefab");
+        const expected = if (filtered)
+            try std.fmt.allocPrint(git.arena, "{s}# canonical-token\n", .{source_expected})
+        else
+            try std.mem.replaceOwned(u8, git.arena, source_expected, "\n", "\r\n");
+        if (filtered) {
+            try git.ok(&.{ "config", "filter.fixture.clean", "sed s/worktree-token/canonical-token/g" });
+            try git.ok(&.{ "config", "filter.fixture.smudge", "sed s/canonical-token/worktree-token/g" });
+            const attributes = try std.Io.Dir.cwd().readFileAlloc(git.io, try git.path(".git/info/attributes"), git.arena, .limited(1024 * 1024));
+            try write(git, ".git/info/attributes", try std.fmt.allocPrint(git.arena, "{s}\n*.prefab filter=fixture\n", .{attributes}));
+        } else {
+            try git.ok(&.{ "update-index", "--chmod=+x", "--", path });
+            try git.ok(&.{ "commit", "-qm", "executable array" });
+        }
+        try git.ok(&.{ "checkout-index", "--force", "--all" });
+        try t.expectCode(try git.run(&.{ "merge", "--no-commit", "remote" }), 0, "canonical candidate and worktree encoding");
+        const indexed = try git.output(&.{ "show", try std.fmt.allocPrint(git.arena, ":{s}", .{path}) });
+        try t.require(std.mem.eql(u8, expected, indexed), "candidate canonical bytes changed by filters or line endings");
+        const worktree_expected = if (filtered) try std.mem.replaceOwned(u8, git.arena, expected, "canonical-token", "worktree-token") else expected;
+        try expectFile(git, path, worktree_expected);
+        if (!filtered) try t.require(std.mem.startsWith(u8, try git.output(&.{ "ls-files", "--stage", "-z", "--", path }), "100755 "), "candidate lost executable mode");
+        try git.ok(&.{ "merge", "--abort" });
+        const worktree_ours = if (filtered) try std.mem.replaceOwned(u8, git.arena, sides[1], "canonical-token", "worktree-token") else sides[1];
+        try expectFile(git, path, worktree_ours);
+        if (!filtered) try t.require(std.mem.startsWith(u8, try git.output(&.{ "ls-files", "--stage", "-z", "--", path }), "100755 "), "abort lost executable index mode");
+    }
+}
+
+fn cleanRenames(ctx: Context) !void {
+    try independentAdditions(ctx);
+    const plain_base = "--- !u!114 &1\nMonoBehaviour:\n  m_Items: [A, B]\n";
+    const plain_edit = "--- !u!114 &1\nMonoBehaviour:\n  m_Items: [A, C]\n";
+    for ([_]bool{ false, true }) |reverse| {
+        const name = if (reverse) "clean-rename-incoming" else "clean-rename-ours";
+        const git = try ctx.repo(name, &.{ .{ .path = "Assets/A.prefab", .base = plain_base, .ours = if (reverse) plain_edit else plain_base, .theirs = if (reverse) plain_base else plain_edit }, .{ .path = "Assets/History.prefab", .base = base, .ours = ours, .theirs = theirs } });
+        if (reverse) try git.ok(&.{ "switch", "-q", "remote" });
+        try git.ok(&.{ "mv", "Assets/A.prefab", "Assets/B.prefab" });
+        try git.ok(&.{ "commit", "-qm", "rename array" });
+        if (reverse) try git.ok(&.{ "switch", "-q", "local" });
+        std.debug.print("native rename: {s}\n", .{name});
+        try t.expectCode(try git.run(&.{ "merge", "--no-commit", "remote" }), 0, "clean rename preserves opposite array edit");
+        try expectFile(git, "Assets/B.prefab", plain_edit);
+        try t.require(std.mem.eql(u8, try git.output(&.{ "show", ":0:Assets/B.prefab" }), plain_edit), "renamed canonical array lost opposite edit");
+        try t.require((try git.output(&.{ "ls-files", "--", "Assets/A.prefab" })).len == 0, "clean rename restored old path");
+        try t.require((try git.output(&.{ "ls-files", "--unmerged" })).len == 0, "clean rename left stages");
+        try git.ok(&.{ "merge", "--abort" });
+        try expectFile(git, if (reverse) "Assets/A.prefab" else "Assets/B.prefab", if (reverse) plain_edit else plain_base);
+    }
+    // Disabling rename detection leaves the delete/edit relationship explicit.
+    for ([_][]const u8{ "merge.renames", "diff.renames" }) |setting| {
+        const git = try ctx.repo(setting, &.{ .{ .path = "Assets/A.prefab", .base = plain_base, .ours = plain_base, .theirs = plain_edit }, .{ .path = "Assets/History.prefab", .base = base, .ours = ours, .theirs = theirs } });
+        try git.ok(&.{ "mv", "Assets/A.prefab", "Assets/B.prefab" });
+        try git.ok(&.{ "commit", "-qm", "rename array" });
+        try git.ok(&.{ "config", setting, "false" });
+        std.debug.print("native rename setting: {s}=false\n", .{setting});
+        const candidate = try git.run(&.{ "merge-tree", "--write-tree", "-z", "--messages", "HEAD", "remote" });
+        const tree_end = std.mem.indexOfScalar(u8, candidate.stdout, 0) orelse return error.InvalidMergeOutput;
+        const candidate_spec = try std.fmt.allocPrint(git.arena, "{s}:Assets/B.prefab", .{candidate.stdout[0..tree_end]});
+        const accepted = try git.output(&.{ "show", candidate_spec });
+        const old_candidate_path = try git.output(&.{ "ls-tree", "-z", candidate.stdout[0..tree_end], "--", "Assets/A.prefab" });
+        try t.expectCode(try git.run(&.{ "merge", "--no-commit", "remote" }), 1, "disabled or unproved rename stays explicit");
+        try expectFile(git, "Assets/B.prefab", accepted);
+        if (old_candidate_path.len == 0) {
+            try t.require(std.mem.eql(u8, accepted, plain_edit), "Git rename candidate lost its accepted array edit");
+            try t.require((try git.output(&.{ "ls-files", "--unmerged", "--", "Assets/B.prefab" })).len != 0, "unproved historical path silently completed");
+            try t.expectNonzero(try git.run(&.{ "show", ":1:Assets/B.prefab" }), "unproved rename invented base stage");
+        } else {
+            try t.require(std.mem.eql(u8, accepted, plain_base), "disabled rename produced unexpected Git content");
+            try t.require((try git.output(&.{ "ls-files", "--unmerged", "--", "Assets/A.prefab" })).len != 0, "disabled rename lost original structural stages");
+            try t.require((try git.output(&.{ "ls-files", "--unmerged", "--", "Assets/B.prefab" })).len == 0, "disabled rename inferred a relationship for the addition");
+        }
+        try git.ok(&.{ "merge", "--abort" });
+        try expectFile(git, "Assets/B.prefab", plain_base);
+    }
+}
+
+fn independentAdditions(ctx: Context) !void {
+    const old = "--- !u!114 &1\nMonoBehaviour:\n  m_Items: [A, B]\n";
+    const added = "--- !u!114 &987\nMonoBehaviour:\n  completelyDifferentCollection: [100, 200, 300, 400, 500, 600, 700, 800, 900]\n";
+    for ([_]bool{ false, true }) |reverse| {
+        const name = if (reverse) "independent-addition-incoming" else "independent-addition-ours";
+        const git = try ctx.repo(name, &.{ .{ .path = "Assets/Old.prefab", .base = old, .ours = old, .theirs = old }, .{ .path = "Assets/History.prefab", .base = base, .ours = ours, .theirs = theirs } });
+        if (reverse) try git.ok(&.{ "switch", "-q", "remote" });
+        try git.ok(&.{ "rm", "Assets/Old.prefab" });
+        try write(git, "Assets/New.prefab", added);
+        try git.ok(&.{ "add", "Assets/New.prefab" });
+        try git.ok(&.{ "commit", "-qm", "delete old asset and add independent collection" });
+        const changed_side = merge_git.trim(try git.output(&.{ "rev-parse", "HEAD" }));
+        if (reverse) try git.ok(&.{ "switch", "-q", "local" });
+        const ancestor = merge_git.trim(try git.output(&.{ "merge-base", "HEAD", "remote" }));
+        const relationships = try git.output(&.{ "diff-tree", "--no-commit-id", "--name-status", "-r", "-z", "--find-renames", ancestor, changed_side });
+        try t.require(std.mem.indexOf(u8, relationships, "A\x00Assets/New.prefab\x00") != null and std.mem.indexOf(u8, relationships, "D\x00Assets/Old.prefab\x00") != null, "independent addition fixture became a Git rename");
+        std.debug.print("native independent addition: {s}\n", .{name});
+        try t.expectCode(try git.run(&.{ "merge", "--no-commit", "remote" }), 0, "unrelated deletion cannot block a collection addition");
+        try expectFile(git, "Assets/New.prefab", added);
+        try t.require(std.mem.eql(u8, try git.output(&.{ "show", ":0:Assets/New.prefab" }), added), "independent canonical addition changed");
+        try expectFile(git, "Assets/History.prefab", merged);
+        try t.require((try git.output(&.{ "ls-files", "--", "Assets/Old.prefab" })).len == 0, "independent deletion was reverted");
+        try t.require((try git.output(&.{ "ls-files", "--unmerged" })).len == 0, "independent addition retained stages");
+        try git.ok(&.{ "merge", "--abort" });
+        try expectFile(git, if (reverse) "Assets/Old.prefab" else "Assets/New.prefab", if (reverse) old else added);
+        try expectFile(git, "Assets/History.prefab", ours);
+    }
 }

@@ -73,6 +73,12 @@ const FooterGeometry = struct {
     }
 };
 
+const ours_combined_label = "Ours + Theirs";
+const theirs_combined_label = "Theirs + Ours";
+const combine_toggle_off = "One side";
+const combine_toggle_on = "Both sides";
+const combine_toggle_shortcut = "⇧T";
+
 const QuitDialogGeometry = struct {
     top: u16,
     bottom: u16,
@@ -216,6 +222,7 @@ pub const View = struct {
     vertical_offset: usize = 0,
     focus_area: FocusArea = .hierarchy,
     selected_value: ValueColumn = .ours,
+    combine_mode: bool = false,
     quit_dialog: bool = false,
     quit_choice: QuitChoice = .cancel,
     empty_dialog: bool = false,
@@ -260,6 +267,32 @@ pub const View = struct {
         return .{ .width = screen.width, .height = screen.height };
     }
 
+    fn valueGeometry(self: *const View, width: u16) Geometry {
+        var result = Geometry.init(width);
+        if (self.canCombine()) {
+            // Keep both order labels readable without moving columns when the mode changes.
+            result.ours.end = @max(result.ours.end, result.ours.start + @as(u16, ours_combined_label.len) + 1);
+            result.theirs.start = result.ours.end;
+            result.theirs.end = @max(result.theirs.end, result.theirs.start + @as(u16, theirs_combined_label.len) + 1);
+            result.result.start = result.theirs.end;
+        }
+        return result;
+    }
+
+    fn combineToggleRange(self: *const View, width: u16) Range {
+        const geometry = self.valueGeometry(width);
+        const property = selectedPropertyName(self);
+        const heading_width = textWidth(selectedComponentName(self)) +|
+            if (property.len == 0) @as(u16, 0) else textWidth(property) +| 3;
+        const toggle_width = textWidth("⇧T Both sides");
+        // Keep the mode beside its field and above the choices it changes.
+        const start = @min(
+            @max(geometry.ours.start, geometry.inspector.start +| heading_width +| 2),
+            geometry.theirs.end - toggle_width,
+        );
+        return .{ .start = start, .end = start + toggle_width };
+    }
+
     fn ensureSelectionVisible(self: *View, size: vxfw.Size) void {
         if (!isUsableSize(size)) return;
         const visible_rows = BodyGeometry.init(size.height).visibleRows();
@@ -293,7 +326,7 @@ pub const View = struct {
         size: vxfw.Size,
     ) bool {
         if (mouse.type != .press or mouse.col < 0) return false;
-        if (!inRange(@intCast(mouse.col), Geometry.init(size.width).hierarchy)) return false;
+        if (!inRange(@intCast(mouse.col), self.valueGeometry(size.width).hierarchy)) return false;
         switch (mouse.button) {
             .wheel_up => self.scrollUp(ctx, size),
             .wheel_down => self.scrollDown(ctx, size),
@@ -318,7 +351,9 @@ pub const View = struct {
             .move_up, .move_down, .select_conflict => self.horizontal_offset = 0,
             else => {},
         }
+        const previous_conflict = self.state.selected_conflict;
         try self.state.handle(action);
+        if (self.state.selected_conflict != previous_conflict) self.combine_mode = false;
         self.ensureSelectionVisible(size);
         const should_quit = action == .abort and self.state.outcome == .aborted;
         if (should_quit) ctx.quit = true;
@@ -351,6 +386,7 @@ pub const View = struct {
         key: vaxis.Key,
     ) !void {
         try self.beginResultEdit(ctx, "", false);
+        if (!self.editing) return;
         try self.editor.handleEvent(ctx, .{ .key_press = key });
     }
 
@@ -394,6 +430,7 @@ pub const View = struct {
         const applied = self.state.status.len == 0 and
             self.state.plan.operations[operation_index].resolution != .unresolved;
         if (applied) {
+            self.combine_mode = false;
             self.editor.clearRetainingCapacity();
             self.editing = false;
             self.replace_on_input = false;
@@ -436,10 +473,11 @@ pub const View = struct {
         if (mouse.type != .press or mouse.button != .left or mouse.col < 0 or mouse.row < 0) return;
         const col: u16 = @intCast(mouse.col);
         const row: u16 = @intCast(mouse.row);
-        const geometry = Geometry.init(size.width);
+        const geometry = self.valueGeometry(size.width);
         const body = BodyGeometry.init(size.height);
+        if (self.canCombine() and row == body.inspector_heading_row and inRange(col, self.combineToggleRange(size.width)))
+            return ctx.consumeEvent();
         if (row == body.inspector_rows.start and inRange(col, geometry.result)) return;
-
         if (!try self.finishEditorForNavigation(ctx)) return;
         try self.handleMouse(ctx, mouse, size);
     }
@@ -671,17 +709,25 @@ pub const View = struct {
         return &self.state.plan.operations[operation_index];
     }
 
-    fn selectedText(self: *const View) []const u8 {
-        const operation = self.selectedOperation() orelse return "";
-        return switch (self.selected_value) {
+    fn columnText(self: *const View, arena: std.mem.Allocator, operation: *const core.merge.Operation, column: ValueColumn) std.mem.Allocator.Error![]const u8 {
+        const pending = self.state.pending orelse operation.resolution;
+        if (self.combinedChoices() and (column == .ours or column == .theirs)) {
+            return core.merge.combinedCollectionValue(arena, self.state.plan, operation.id, if (column == .ours) .ours_first else .theirs_first) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => "<unavailable>",
+            };
+        }
+        return switch (column) {
             .base => sideText(operation.values.base),
             .ours => sideText(operation.values.ours),
             .theirs => sideText(operation.values.theirs),
-            .result => resolutionText(
-                operation,
-                self.state.pending orelse operation.resolution,
-            ),
+            .result => resolutionText(operation, pending),
         };
+    }
+
+    fn selectedText(self: *const View, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        const operation = self.selectedOperation() orelse return "";
+        return self.columnText(arena, operation, self.selected_value);
     }
 
     fn selectedResultInput(self: *const View) []const u8 {
@@ -700,7 +746,9 @@ pub const View = struct {
     }
 
     fn maxHorizontalOffset(self: *const View, geometry: Geometry) usize {
-        const text = self.selectedText();
+        var memory = std.heap.ArenaAllocator.init(self.state.allocator);
+        defer memory.deinit();
+        const text = self.selectedText(memory.allocator()) catch return 0;
         const selected_range = valueRange(geometry, self.selected_value);
         const viewport_width: usize = selected_range.end - selected_range.start -| 2;
         var total_width: usize = 0;
@@ -730,7 +778,7 @@ pub const View = struct {
     }
 
     fn scrollRight(self: *View, ctx: *vxfw.EventContext, size: vxfw.Size) void {
-        const geometry = Geometry.init(size.width);
+        const geometry = self.valueGeometry(size.width);
         self.horizontal_offset = @min(
             self.horizontal_offset +| 1,
             self.maxHorizontalOffset(geometry),
@@ -813,11 +861,11 @@ pub const View = struct {
             .hierarchy => try self.focusInspector(ctx),
             .inspector => switch (self.selected_value) {
                 .base, .ours => {
-                    try self.state.handle(.choose_ours);
+                    try self.state.handle(self.choiceAction(.ours));
                     try self.applyPendingResult(ctx, size);
                 },
                 .theirs => {
-                    try self.state.handle(.choose_theirs);
+                    try self.state.handle(self.choiceAction(.theirs));
                     try self.applyPendingResult(ctx, size);
                 },
                 .result => try self.activateResult(ctx, size),
@@ -829,6 +877,30 @@ pub const View = struct {
         }
     }
 
+    fn canCombine(self: *const View) bool {
+        const operation = self.selectedOperation() orelse return false;
+        const conflict = core.merge.collectionConflict(self.state.plan, operation.id) orelse return false;
+        return conflict.both_orders;
+    }
+
+    fn combinedChoices(self: *const View) bool {
+        return self.combine_mode and self.canCombine();
+    }
+
+    fn toggleCombine(self: *View, ctx: *vxfw.EventContext) void {
+        self.combine_mode = !self.combine_mode;
+        self.horizontal_offset = 0;
+        ctx.consumeAndRedraw();
+    }
+
+    fn choiceAction(self: *const View, column: ValueColumn) merge_ui_state.Action {
+        return switch (column) {
+            .ours => if (self.combinedChoices()) .combine_ours_first else .choose_ours,
+            .theirs => if (self.combinedChoices()) .combine_theirs_first else .choose_theirs,
+            .base, .result => unreachable,
+        };
+    }
+
     fn handleMouse(
         self: *View,
         ctx: *vxfw.EventContext,
@@ -837,7 +909,7 @@ pub const View = struct {
     ) !void {
         if (self.handleHierarchyWheel(ctx, mouse, size)) return;
         if (mouse.type != .press) return;
-        const geometry = Geometry.init(size.width);
+        const geometry = self.valueGeometry(size.width);
         if (mouse.button == .wheel_left) return self.scrollLeft(ctx);
         if (mouse.button == .wheel_right) return self.scrollRight(ctx, size);
         if (mouse.button != .left or mouse.col < 0 or mouse.row < 0) return;
@@ -845,6 +917,10 @@ pub const View = struct {
         const row: u16 = @intCast(mouse.row);
         const footer = FooterGeometry.init(size.width, size.height);
         const body = BodyGeometry.init(size.height);
+        if (self.canCombine() and row == body.inspector_heading_row and inRange(col, self.combineToggleRange(size.width))) {
+            if (self.focus_area != .inspector or self.selected_value == .result) try self.focusInspector(ctx);
+            return self.toggleCombine(ctx);
+        }
         if (self.state.outcome == .ready and
             row == footer.row and inRange(col, footer.complete))
         {
@@ -868,14 +944,14 @@ pub const View = struct {
             self.selected_value = .ours;
             self.horizontal_offset = 0;
             try self.state.handle(.pane_right);
-            return self.dispatch(ctx, .choose_ours, size);
+            return self.dispatch(ctx, self.choiceAction(.ours), size);
         }
         if (inRange(col, geometry.theirs)) {
             self.focus_area = .inspector;
             self.selected_value = .theirs;
             self.horizontal_offset = 0;
             try self.state.handle(.pane_right);
-            return self.dispatch(ctx, .choose_theirs, size);
+            return self.dispatch(ctx, self.choiceAction(.theirs), size);
         }
         if (inRange(col, geometry.result)) {
             self.focus_area = .inspector;
@@ -976,6 +1052,15 @@ fn skipGraphemes(text: []const u8, count: usize) []const u8 {
     return text[byte_offset..];
 }
 
+fn textWidth(text: []const u8) u16 {
+    var columns: u16 = 0;
+    var graphemes = vaxis.unicode.graphemeIterator(text);
+    while (graphemes.next()) |grapheme| {
+        columns +|= vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode);
+    }
+    return columns;
+}
+
 fn draw(
     userdata: *anyopaque,
     ctx: vxfw.DrawContext,
@@ -1007,7 +1092,7 @@ fn draw(
         return surface;
     }
 
-    const geometry = Geometry.init(size.width);
+    const geometry = self.valueGeometry(size.width);
     const footer = FooterGeometry.init(size.width, size.height);
     const body = BodyGeometry.init(size.height);
     if (size_changed) self.ensureSelectionVisible(size) else self.clampVerticalOffset(size);
@@ -1020,7 +1105,7 @@ fn draw(
     const content_start = geometry.hierarchy.start;
     const content_end = geometry.inspector.end;
     writeClipped(surface, content_start, body.header_row, content_end - content_start - 20, self.path);
-    writeClipped(surface, content_end - 20, body.header_row, 20, unresolved);
+    writeClipped(surface, content_end - @as(u16, @intCast(unresolved.len)), body.header_row, @intCast(unresolved.len), unresolved);
     styleRange(
         surface,
         body.header_row,
@@ -1042,26 +1127,44 @@ fn draw(
             selectedPropertyName(self),
         },
     );
+    const heading_end = if (self.canCombine()) self.combineToggleRange(size.width).start - 2 else geometry.inspector.end;
     writeClipped(
         surface,
         geometry.inspector.start,
         body.inspector_heading_row,
-        geometry.inspector.end - geometry.inspector.start,
+        heading_end - geometry.inspector.start,
         inspector_heading,
     );
     styleRange(surface, body.inspector_heading_row, geometry.inspector, .{ .fg = Palette.muted });
+    if (self.canCombine()) {
+        const toggle = self.combineToggleRange(size.width);
+        const label = if (self.combine_mode) combine_toggle_on else combine_toggle_off;
+        const label_start = toggle.start + 3;
+        if (self.focus_area == .inspector and self.selected_value != .result and !self.editing) {
+            writeClipped(surface, toggle.start, body.inspector_heading_row, 2, combine_toggle_shortcut);
+        }
+        writeClipped(surface, label_start, body.inspector_heading_row, toggle.end - label_start, label);
+        if (!self.editing) {
+            styleRange(surface, body.inspector_heading_row, .{ .start = label_start, .end = label_start + @as(u16, @intCast(label.len)) }, .{ .fg = Palette.accent, .bold = true, .ul_style = .single });
+        }
+    }
     inline for (.{
         .{ geometry.base, "Base", ValueColumn.base },
         .{ geometry.ours, "Ours", ValueColumn.ours },
         .{ geometry.theirs, "Theirs", ValueColumn.theirs },
         .{ geometry.result, "Result", ValueColumn.result },
     }) |column| {
+        const label = if (self.combinedChoices()) switch (column[2]) {
+            .ours => ours_combined_label,
+            .theirs => theirs_combined_label,
+            .base, .result => column[1],
+        } else column[1];
         writeClipped(
             surface,
             column[0].start,
             body.inspector_labels_row,
             column[0].end - column[0].start,
-            column[1],
+            label,
         );
         var heading_style = valueStyle(column[2]);
         heading_style.fg = Palette.muted;
@@ -1129,12 +1232,11 @@ fn draw(
 
     if (self.selectedOperation()) |operation| {
         const row = body.inspector_rows.start;
-        const pending = self.state.pending orelse operation.resolution;
         const columns = .{
-            .{ geometry.base, sideText(operation.values.base), ValueColumn.base },
-            .{ geometry.ours, sideText(operation.values.ours), ValueColumn.ours },
-            .{ geometry.theirs, sideText(operation.values.theirs), ValueColumn.theirs },
-            .{ geometry.result, resolutionText(operation, pending), ValueColumn.result },
+            .{ geometry.base, try self.columnText(ctx.arena, operation, .base), ValueColumn.base },
+            .{ geometry.ours, try self.columnText(ctx.arena, operation, .ours), ValueColumn.ours },
+            .{ geometry.theirs, try self.columnText(ctx.arena, operation, .theirs), ValueColumn.theirs },
+            .{ geometry.result, try self.columnText(ctx.arena, operation, .result), ValueColumn.result },
         };
         inline for (columns) |column| {
             const text = if (column[2] == self.selected_value)
@@ -1458,10 +1560,14 @@ fn handleEvent(
             if (key.matches(vaxis.Key.up, .{})) return self.moveUp(ctx, size);
             if (key.matches(vaxis.Key.down, .{})) return self.moveDown(ctx, size);
             if (key.matches(vaxis.Key.enter, .{})) return self.activate(ctx, size);
+            if (self.focus_area == .inspector and self.selected_value != .result and
+                self.canCombine() and key.matches('t', .{ .shift = true }))
+                return self.toggleCombine(ctx);
             if (self.focus_area == .inspector and self.selected_value == .result and
                 key.matches(vaxis.Key.backspace, .{}))
             {
                 try self.beginResultEdit(ctx, self.selectedResultInput(), true);
+                if (!self.editing) return;
                 return self.clearInitialResult(ctx);
             }
             if (self.focus_area == .inspector and self.selected_value == .result and
@@ -1497,6 +1603,122 @@ fn screenPlan(arena: std.mem.Allocator) !core.merge.BuildResult {
         "--- !u!54 &54\nRigidbody:\n  m_Mass: 12\n  m_Drag: 2\n",
         "--- !u!54 &54\nRigidbody:\n  m_Mass: 8\n  m_Drag: 3\n",
     );
+}
+
+test "merge TUI: collection toggle retains both orders until Enter applies the focused choice" {
+    for ([_]ValueColumn{ .ours, .theirs }) |column| for ([_][]const u8{ "T", "\x1b[116;2u" }) |input| {
+        var memory = std.heap.ArenaAllocator.init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var built = try core.merge.build(arena, "--- !u!114 &1\nMonoBehaviour:\n  items: [A]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Ours]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Theirs]\n");
+        var state = try merge_ui_state.State.init(arena, &built.plan);
+        var view = try viewForTest(arena, &state, "Array.prefab", built.partial);
+        defer view.deinit();
+        _ = try drawForTest(arena, view.widget(), 140, 20);
+        var ctx = eventContext(arena);
+        try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+        if (column == .theirs) try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+        var parser: vaxis.Parser = .{};
+        const key = (try parser.parse(input, arena)).event.?.key_press;
+        try view.widget().handleEvent(&ctx, .{ .key_press = key });
+        // Terminal modifier reports and focus changes must not undo an explicit toggle.
+        try view.widget().handleEvent(&ctx, .{ .key_release = .{ .codepoint = vaxis.Key.left_shift } });
+        try view.widget().handleEvent(&ctx, .focus_out);
+        for ([_]u16{ 80, 100, 140 }) |width| {
+            const surface = try drawForTest(arena, view.widget(), width, 20);
+            const heading = try rowText(arena, surface, BodyGeometry.init(20).inspector_heading_row);
+            const labels = try rowText(arena, surface, BodyGeometry.init(20).inspector_labels_row);
+            try testing.expect(std.mem.indexOf(u8, heading, "⇧T Both sides") != null);
+            try testing.expect(std.mem.indexOf(u8, heading, "MonoBehaviour › Items") != null);
+            try testing.expectEqualStrings("1 unresolved", try cellsText(arena, surface, BodyGeometry.init(20).header_row, width - horizontal_padding - 12, 12));
+            try testing.expect(std.mem.indexOf(u8, labels, "Ours + Theirs") != null);
+            try testing.expect(std.mem.indexOf(u8, labels, "Theirs + Ours") != null);
+            try testing.expectEqualStrings("", std.mem.trim(u8, try rowText(arena, surface, FooterGeometry.init(width, 20).row), " "));
+            try testing.expectEqualStrings("", std.mem.trim(u8, try rowText(arena, surface, BodyGeometry.init(20).status_row), " "));
+        }
+        // Switching the available choices must not create or apply a Result preview.
+        try testing.expectEqual(@as(usize, 1), state.unresolvedCount());
+        try testing.expect(state.pending == null);
+        try testing.expectEqual(column, view.selected_value);
+        try pressKeyForTest(&view, &ctx, vaxis.Key.enter);
+        try testing.expectEqual(merge_ui_state.Outcome.ready, state.outcome);
+        try testing.expect(std.mem.indexOf(u8, try core.merge.finish(arena, &built.plan), if (column == .ours) "[A, Ours, Theirs]" else "[A, Theirs, Ours]") != null);
+        const surface = try drawForTest(arena, view.widget(), 140, 20);
+        try testing.expectEqualStrings(if (column == .ours) "[Ours, Theirs]" else "[Theirs, Ours]", try cellsText(arena, surface, BodyGeometry.init(20).inspector_rows.start, Geometry.init(140).result.start + 2, 14));
+    };
+}
+
+test "merge TUI: toggling twice restores the original side without moving columns" {
+    var memory = std.heap.ArenaAllocator.init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var built = try core.merge.build(arena, "--- !u!114 &1\nMonoBehaviour:\n  items: [A]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Ours]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Theirs]\n");
+    var state = try merge_ui_state.State.init(arena, &built.plan);
+    var view = try viewForTest(arena, &state, "Array.prefab", built.partial);
+    defer view.deinit();
+    _ = try drawForTest(arena, view.widget(), 80, 10);
+    var ctx = eventContext(arena);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+    const before = view.valueGeometry(80);
+    for (0..2) |_| try view.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 't', .mods = .{ .shift = true } } });
+    const surface = try drawForTest(arena, view.widget(), 80, 10);
+    try testing.expectEqualDeep(before, view.valueGeometry(80));
+    try testing.expect(std.mem.indexOf(u8, try rowText(arena, surface, BodyGeometry.init(10).inspector_heading_row), "⇧T One side") != null);
+    try testing.expect(std.mem.indexOf(u8, try surfaceText(arena, surface), "Ours + Theirs") == null);
+    try testing.expect(state.pending == null);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.enter);
+    try testing.expect(std.mem.indexOf(u8, try core.merge.finish(arena, &built.plan), "[A, Ours]") != null);
+}
+
+test "merge TUI: collection toggle is absent for conflicts without both insertion orders" {
+    for ([_]bool{ false, true }) |collection| {
+        var memory = std.heap.ArenaAllocator.init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var built = if (collection)
+            try core.merge.build(arena, "--- !u!114 &1\nMonoBehaviour:\n  items: [A, B]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Changed]\n")
+        else
+            try screenPlan(arena);
+        var state = try merge_ui_state.State.init(arena, &built.plan);
+        var view = try viewForTest(arena, &state, "Array.prefab", built.partial);
+        defer view.deinit();
+        _ = try drawForTest(arena, view.widget(), 140, 20);
+        var ctx = eventContext(arena);
+        try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+        const before = try surfaceText(arena, try drawForTest(arena, view.widget(), 140, 20));
+        try view.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 't', .mods = .{ .shift = true } } });
+        const screen = try surfaceText(arena, try drawForTest(arena, view.widget(), 140, 20));
+        // Array shape alone is insufficient: delete/edit conflicts cannot combine both sides.
+        try testing.expectEqualStrings(before, screen);
+        try testing.expect(std.mem.indexOf(u8, screen, "⇧T") == null);
+        try testing.expect(state.pending == null);
+    }
+}
+
+test "merge TUI: a collection toggle does not carry over to another conflict" {
+    var memory = std.heap.ArenaAllocator.init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var built = try core.merge.build(arena, "--- !u!114 &1\nMonoBehaviour:\n  items: [A]\n  other: [B]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Ours]\n  other: [B, Left]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Theirs]\n  other: [B, Right]\n");
+    var state = try merge_ui_state.State.init(arena, &built.plan);
+    var view = try viewForTest(arena, &state, "Array.prefab", built.partial);
+    defer view.deinit();
+    _ = try drawForTest(arena, view.widget(), 140, 20);
+    var ctx = eventContext(arena);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+    try view.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 't', .mods = .{ .shift = true } } });
+    try pressKeyForTest(&view, &ctx, vaxis.Key.left);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.down);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+    var screen = try surfaceText(arena, try drawForTest(arena, view.widget(), 140, 20));
+    try testing.expect(std.mem.indexOf(u8, screen, "⇧T One side") != null);
+    try view.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 't', .mods = .{ .shift = true } } });
+    try pressKeyForTest(&view, &ctx, vaxis.Key.enter);
+    // Advancing after an applied choice follows the same rule as manual navigation.
+    try testing.expectEqual(@as(usize, 0), state.selected_conflict);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+    screen = try surfaceText(arena, try drawForTest(arena, view.widget(), 140, 20));
+    try testing.expect(std.mem.indexOf(u8, screen, "⇧T One side") != null);
 }
 
 fn deleteEditPlan(arena: std.mem.Allocator) !core.merge.BuildResult {
@@ -2397,30 +2619,6 @@ test "merge TUI: Escape in Result returns to the hierarchy" {
     try testing.expectEqual(merge_ui_state.Pane.hierarchy, state.pane);
     try testing.expectEqualStrings("▌", surface.readCell(geometry.hierarchy.start, body.hierarchy_rows.start + 2).char.grapheme);
     try testing.expect(!view.editing);
-}
-
-test "merge TUI: letter shortcuts do not decide a merge" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const keys = "otaq";
-
-    for (keys) |key| {
-        var fixture = try screenPlan(arena);
-        var state = try merge_ui_state.State.init(arena, &fixture.plan);
-        var view = try viewForTest(arena, &state, "A.prefab", fixture.partial);
-        defer view.deinit();
-        _ = try drawForTest(arena, view.widget(), 80, 10);
-        var ctx = eventContext(arena);
-
-        try view.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = key } });
-
-        // Letter keys cannot bypass the visible controls and their Enter action.
-        try testing.expectEqual(@as(?core.merge.Resolution, null), state.pending);
-        try testing.expectEqualStrings("", state.status);
-        try testing.expectEqual(merge_ui_state.Outcome.active, state.outcome);
-        try testing.expect(!ctx.quit);
-    }
 }
 
 test "merge TUI: inspector shows only the selected conflict" {
@@ -4612,4 +4810,83 @@ test "merge TUI: a small terminal reports its required size" {
     // The minimum-size branch must avoid geometry underflow and show one concise line.
     try testing.expect(std.mem.indexOf(u8, try rowText(arena, surface, 0), "Needs 80 columns and 10 rows") != null);
     try testing.expectEqual(@as(usize, 0), surface.children.len);
+}
+
+test "merge TUI: Result accepts the toggle letter as text before and during editing" {
+    for ([_][]const u8{ "", "[Edited", "[invalid" }) |prefix| {
+        var memory = std.heap.ArenaAllocator.init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var built = try core.merge.build(arena, "--- !u!114 &1\nMonoBehaviour:\n  items: [A]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Ours]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Theirs]\n");
+        var state = try merge_ui_state.State.init(arena, &built.plan);
+        var view = try viewForTest(arena, &state, "Array.prefab", built.partial);
+        defer view.deinit();
+        _ = try drawForTest(arena, view.widget(), 100, 20);
+        var ctx = eventContext(arena);
+        try focusResultForTest(&view, &ctx);
+        const heading = try rowText(arena, try drawForTest(arena, view.widget(), 100, 20), BodyGeometry.init(20).inspector_heading_row);
+        // The shortcut must not be advertised where its letter enters a Result value.
+        try testing.expect(std.mem.indexOf(u8, heading, "One side") != null);
+        try testing.expect(std.mem.indexOf(u8, heading, "⇧T") == null);
+        var parser: vaxis.Parser = .{};
+        const event = (try parser.parse("T", arena)).event.?;
+        if (prefix.len != 0) {
+            try view.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = '[', .text = prefix } });
+            const surface = try drawForTest(arena, view.widget(), 100, 20);
+            try routeFocusedEventForTest(arena, surface, view.editor.widget(), &ctx, .{ .key_press = event.key_press });
+        } else {
+            try view.widget().handleEvent(&ctx, .{ .key_press = event.key_press });
+        }
+        // A display mode shortcut must not replace or submit a Result draft.
+        try testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}T", .{prefix}), try view.editor.toOwnedSlice());
+        try testing.expect(state.pending == null);
+        try testing.expectEqual(@as(usize, 1), state.unresolvedCount());
+        try testing.expect(view.editing);
+    }
+}
+
+test "merge TUI: clicking the collection toggle and a side previews a replacement result" {
+    var memory = std.heap.ArenaAllocator.init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var built = try core.merge.build(arena, "--- !u!114 &1\nMonoBehaviour:\n  items: [A]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Ours]\n", "--- !u!114 &1\nMonoBehaviour:\n  items: [A, Theirs]\n");
+    var state = try merge_ui_state.State.init(arena, &built.plan);
+    var view = try viewForTest(arena, &state, "Array.prefab", built.partial);
+    defer view.deinit();
+    _ = try drawForTest(arena, view.widget(), 140, 20);
+    var ctx = eventContext(arena);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.enter);
+    try testing.expectEqual(merge_ui_state.Outcome.ready, state.outcome);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.left);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+    try view.widget().handleEvent(&ctx, .{ .mouse = .{
+        .col = @intCast(Geometry.init(140).ours.start + 2),
+        .row = @intCast(BodyGeometry.init(20).inspector_heading_row),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    // Merely viewing the available orders must leave the confirmed result intact.
+    try testing.expectEqual(merge_ui_state.Outcome.ready, state.outcome);
+    try view.widget().handleEvent(&ctx, .{ .mouse = .{
+        .col = @intCast(Geometry.init(140).theirs.start + 2),
+        .row = @intCast(BodyGeometry.init(20).inspector_rows.start),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    const surface = try drawForTest(arena, view.widget(), 140, 20);
+    const screen = try surfaceText(arena, surface);
+    try testing.expect(std.mem.indexOf(u8, screen, "[Complete]") == null);
+    try testing.expectEqual(merge_ui_state.Outcome.active, state.outcome);
+    try view.widget().handleEvent(&ctx, .{ .mouse = .{ .col = 130, .row = 18, .button = .left, .mods = .{}, .type = .press } });
+    try testing.expect(!ctx.quit);
+    try testing.expectEqualStrings("[Theirs, Ours]", state.pending.?.custom);
+    // Returning to single-side choices must leave the selected Result preview intact.
+    try view.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 't', .mods = .{ .shift = true } } });
+    try pressKeyForTest(&view, &ctx, vaxis.Key.right);
+    try pressKeyForTest(&view, &ctx, vaxis.Key.enter);
+    try testing.expectEqual(merge_ui_state.Outcome.ready, state.outcome);
+    try testing.expect(std.mem.indexOf(u8, try core.merge.finish(arena, &built.plan), "[A, Theirs, Ours]") != null);
 }

@@ -1,13 +1,14 @@
 const std = @import("std");
 const core = @import("core");
 const merge_git = @import("merge_git.zig");
-const merge_io = @import("merge_io.zig");
 const atomic_file = @import("atomic_file.zig");
 const merge_ui_state = @import("merge_ui_state.zig");
 const merge_tui = @import("merge_tui.zig");
-const fallback = @import("merge_fallback.zig");
 const file_conflict = @import("merge_file_conflict.zig");
 const installation = @import("installation.zig");
+const strategy_revisions = @import("merge_strategy_revisions.zig");
+const candidate_module = @import("merge_candidate.zig");
+const session_context = @import("merge_session_context.zig");
 const Git = merge_git.Git;
 
 pub const Stage = struct {
@@ -18,7 +19,7 @@ pub const Stage = struct {
     record: []const u8,
 };
 pub const Conflict = struct { paths: []const []const u8, kind: []const u8, message: []const u8 };
-pub const Result = struct { tree: []const u8, stages: []const Stage, conflicts: []const Conflict, ours: []const u8 = "HEAD", theirs: ?[]const u8 = null };
+pub const Result = struct { tree: []const u8, stages: []const Stage, conflicts: []const Conflict, ours: []const u8 = "HEAD", theirs: ?[]const u8 = null, index_before: ?[]const u8 = null, sources: ?strategy_revisions.Sources = null, strategy_options: []const []const u8 = &.{} };
 
 fn validOid(oid: []const u8) bool {
     if (oid.len != 40 and oid.len != 64) return false;
@@ -88,80 +89,77 @@ pub fn run(io: std.Io, arena: std.mem.Allocator, args: []const []const u8, env: 
     const head = args[separator + 1];
     const remote = args[separator + 2];
     if (!validOid(remote) or (!std.mem.eql(u8, head, "HEAD") and !validOid(head))) return error.InvalidStrategyArguments;
-    if (merge_git.exitCode(try git.run(&.{ "diff-index", "--cached", "--quiet", head, "--" })) != 0) {
+    const sources = try strategy_revisions.read(git, head, remote);
+    try sources.apply(&git_env);
+    const index_before = try std.Io.Dir.cwd().readFileAlloc(io, try indexPath(git), arena, .limited(256 * 1024 * 1024));
+    if (merge_git.exitCode(try git.run(&.{ "diff-index", "--cached", "--quiet", sources.ours, "--" })) != 0) {
         try stderr.writeAll("prefablens: Commit or unstage index changes before this merge.\n");
         return 2;
     }
     if (base_count == 0) try options.append(arena, "--allow-unrelated-histories");
-    const merge_args = try std.mem.concat(arena, []const u8, &.{ &.{ "merge-tree", "--write-tree", "-z", "--messages" }, options.items, &.{ head, remote } });
+    const merge_args = try std.mem.concat(arena, []const u8, &.{ &.{ "merge-tree", "--write-tree", "-z", "--messages" }, options.items, &.{ sources.ours, sources.theirs } });
     const output = try git.run(merge_args);
     if (merge_git.exitCode(output) > 1) {
         try stderr.writeAll(output.stderr);
         return 2;
     }
     var result = try parse(arena, output.stdout);
-    result.ours = head;
-    result.theirs = remote;
-    try install(git, head, result);
-    return resolveSession(git, result, env, stderr) catch |err| {
+    result.ours = sources.ours;
+    result.theirs = sources.theirs;
+    result.index_before = index_before;
+    result.sources = sources;
+    result.strategy_options = options.items;
+    var candidate = try candidate_module.Candidate.init(git, result);
+    defer candidate.deinit();
+    try candidate.automatic();
+    try install(git, sources.ours, candidate.result);
+    return resolveSession(git, &candidate, env, stderr) catch |err| {
         try stderr.print("prefablens: Merge remains unresolved: {s}.\n", .{@errorName(err)});
         return 1;
     };
 }
 
-fn resolveSession(git: Git, result: Result, env: *std.process.Environ.Map, stderr: *std.Io.Writer) !u8 {
-    // Git still owns MERGE_HEAD, merge commits, squash and abort after this command returns.
+fn resolveSession(git: Git, candidate: *candidate_module.Candidate, env: *std.process.Environ.Map, stderr: *std.Io.Writer) !u8 {
+    // Git owns MERGE_HEAD, merge commits, squash and abort after this command returns.
     const tty = (std.Io.File.stdin().isTty(git.io) catch false) and (std.Io.File.stdout().isTty(git.io) catch false);
-    var resolved: std.StringHashMap(void) = .init(git.arena);
-    var aborted = false;
-    // File groups retire matching metadata conflicts before the content pass considers them.
-    if (tty) for (result.conflicts) |conflict| {
-        if (!isStructural(conflict.kind) or allResolved(conflict.paths, &resolved)) continue;
-        switch (try file_conflict.resolve(git, result, conflict, env)) {
-            .unresolved => {},
-            .aborted => {
-                aborted = true;
-                break;
-            },
-            .resolved => |paths| for (paths) |path| {
-                try resolved.put(path, {});
-            },
-        }
-    };
-    for (result.conflicts) |conflict| {
-        if (aborted) break;
-        if (allResolved(conflict.paths, &resolved)) continue;
-        if (tty and std.mem.eql(u8, conflict.kind, "CONFLICT (contents)") and conflict.paths.len == 1) {
-            const path = conflict.paths[0];
-            switch (try resolveContent(git, result, path, env)) {
-                .resolved => try resolved.put(path, {}),
+    if (tty) while (true) {
+        const index = for (candidate.items.items, 0..) |_, i| {
+            if (candidate.ready(i)) break i;
+        } else break;
+        candidate.items.items[index].attempted = true;
+        const item = candidate.items.items[index];
+        var captured = try session_context.readIndex(&candidate.store);
+        captured.snapshot = session_context.maskUnresolved(captured.snapshot, try candidate.pendingPaths());
+        if (item.conflict != null and isStructural(item.conflict.?.kind)) {
+            switch (try file_conflict.resolveWithContext(git, candidate.result, item.conflict.?, env, captured)) {
+                .unresolved => {},
+                .aborted => break,
+                .resolved => |paths| try candidate.refresh(paths),
+            }
+        } else {
+            switch (try resolveContent(git, candidate, index, captured, env)) {
+                .resolved => try candidate.refresh(item.paths),
                 .aborted => break,
                 .unresolved => {},
             }
         }
-    }
-    var unresolved = false;
-    for (result.conflicts) |conflict| {
-        if ((isStructural(conflict.kind) or std.mem.eql(u8, conflict.kind, "CONFLICT (contents)")) and allResolved(conflict.paths, &resolved)) continue;
-        unresolved = true;
-        try stderr.writeAll(conflict.message);
-    }
+    };
+    for (candidate.result.conflicts) |conflict| try stderr.writeAll(conflict.message);
     const remaining = try git.output(&.{ "ls-files", "--unmerged", "-z" });
-    return if (unresolved or remaining.len != 0) 1 else 0;
+    return if (candidate.result.conflicts.len != 0 or remaining.len != 0) 1 else 0;
 }
 
 fn isStructural(kind: []const u8) bool {
     return std.mem.eql(u8, kind, "CONFLICT (modify/delete)") or std.mem.eql(u8, kind, "CONFLICT (rename/delete)") or std.mem.eql(u8, kind, "CONFLICT (rename/rename)");
 }
 
-fn allResolved(paths: []const []const u8, resolved: *std.StringHashMap(void)) bool {
-    if (paths.len == 0) return false;
-    for (paths) |path| if (!resolved.contains(path)) return false;
-    return true;
+fn indexPath(git: Git) ![]const u8 {
+    const relative = merge_git.trim(try git.output(&.{ "rev-parse", "--git-path", "index" }));
+    return if (std.fs.path.isAbsolute(relative)) relative else git.path(relative);
 }
 
 fn install(git: Git, head: []const u8, result: Result) !void {
-    const index_path = merge_git.trim(try git.output(&.{ "rev-parse", "--git-path", "index" }));
+    const index_path = try indexPath(git);
     const lock_path = try std.fmt.allocPrint(git.arena, "{s}.lock", .{index_path});
     const cwd = std.Io.Dir.cwd();
     const lock = try cwd.createFile(git.io, lock_path, .{ .exclusive = true });
@@ -170,6 +168,8 @@ fn install(git: Git, head: []const u8, result: Result) !void {
         cwd.deleteFile(git.io, lock_path) catch {};
     }
     const original = try cwd.readFileAlloc(git.io, index_path, git.arena, .limited(256 * 1024 * 1024));
+    // A staged source edit can invalidate the candidate's type or inheritance evidence.
+    if (result.index_before) |before| if (!std.mem.eql(u8, before, original)) return error.SourceChanged;
     var random: [16]u8 = undefined;
     git.io.random(&random);
     const scratch = try std.fmt.allocPrint(git.arena, "{s}.prefablens-{x}", .{ index_path, random });
@@ -230,14 +230,21 @@ pub fn blob(git: Git, stage: ?Stage) ![]const u8 {
 
 const ContentOutcome = enum { resolved, unresolved, aborted };
 
-fn resolveContent(git: Git, result: Result, path: []const u8, env: *std.process.Environ.Map) !ContentOutcome {
-    const base = blob(git, side(result.stages, path, 1)) catch return .unresolved;
-    const ours = blob(git, side(result.stages, path, 2)) catch return .unresolved;
-    const theirs = blob(git, side(result.stages, path, 3)) catch return .unresolved;
-    if (fallback.isBinary(base) or fallback.isBinary(ours) or fallback.isBinary(theirs)) return .unresolved;
-    if (!core.isUnityYaml(ours) or !core.isUnityYaml(theirs) or (base.len != 0 and !core.isUnityYaml(base))) return .unresolved;
-    var built = core.merge.build(git.arena, base, ours, theirs) catch return .unresolved;
-    const prepared = try file_conflict.prepareContent(git, result, path) orelse return .unresolved;
+fn resolveContent(git: Git, candidate: *candidate_module.Candidate, index: usize, captured: session_context.Index, env: *std.process.Environ.Map) !ContentOutcome {
+    const path = candidate.items.items[index].paths[0];
+    if (candidate.result.sources.?.known == null) {
+        if (candidate.items.items[index].paths.len != 1) return .unresolved;
+        const inputs = candidate.readInputs(path) catch return .unresolved;
+        if (!core.isUnityYaml(inputs.ours) or !core.isUnityYaml(inputs.theirs)) return .unresolved;
+        const prepared = try file_conflict.prepareContent(git, candidate.result, path) orelse return .unresolved;
+        if (!std.mem.eql(u8, captured.before, prepared.index_before)) return error.SourceChanged;
+        const bytes = (try @import("merge_unknown_context.zig").choose(git, env, path, inputs.ours, inputs.theirs)) orelse return .aborted;
+        try file_conflict.finishContent(git, prepared, bytes);
+        return .resolved;
+    }
+    var built = (try candidate.build(index, captured.snapshot)) orelse return .unresolved;
+    const prepared = try file_conflict.prepareContent(git, candidate.result, path) orelse return .unresolved;
+    if (!std.mem.eql(u8, captured.before, prepared.index_before)) return error.SourceChanged;
     var state = try merge_ui_state.State.init(git.arena, &built.plan);
     if (state.outcome != .ready) try merge_tui.run(git.io, git.arena, env, &state, path, built.partial);
     if (state.outcome == .aborted) return .aborted;
@@ -267,4 +274,42 @@ test "Git strategy: preserves path bytes and rejects truncated relationships" {
     try std.testing.expectEqualStrings("Assets/a\tb\nc.prefab", parsed.stages[0].path);
     try std.testing.expectEqualStrings("Assets/a\tb\nc.prefab", parsed.conflicts[0].paths[0]);
     try std.testing.expectError(error.InvalidMergeOutput, parse(arena.allocator(), tree ++ "\x00\x003\x00old\x00ours\x00"));
+}
+
+test "Git strategy: a staged source change rejects candidate installation" {
+    const testing = std.testing;
+    var memory = std.heap.ArenaAllocator.init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(arena);
+    try env.put("PATH", "/usr/bin:/bin");
+    const git: Git = .{ .io = testing.io, .arena = arena, .env = &env, .cwd = try tmp.dir.realPathFileAlloc(testing.io, ".", arena) };
+    try git.ok(&.{ "init", "-q" });
+    try @import("git_merge_test_main.zig").configureHermeticRepository(testing.io, arena, git.cwd);
+    try git.ok(&.{ "config", "user.name", "Fixture" });
+    try git.ok(&.{ "config", "user.email", "fixture@example.invalid" });
+    try tmp.dir.createDir(testing.io, "Assets", .default_dir);
+    const original = "--- !u!114 &1\nMonoBehaviour:\n  value: 1\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "Assets/A.prefab", .data = original });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "Assets/Source.cs", .data = "class Source {}\n" });
+    try git.ok(&.{ "add", "--all" });
+    try git.ok(&.{ "commit", "-qm", "base" });
+    const head = merge_git.trim(try git.output(&.{ "rev-parse", "HEAD" }));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "Assets/A.prefab", .data = "--- !u!114 &1\nMonoBehaviour:\n  value: 2\n" });
+    try git.ok(&.{ "add", "Assets/A.prefab" });
+    try git.ok(&.{ "commit", "-qm", "candidate" });
+    const tree = merge_git.trim(try git.output(&.{ "rev-parse", "HEAD^{tree}" }));
+    try git.ok(&.{ "checkout", "-q", "--detach", head });
+    const before = try tmp.dir.readFileAlloc(testing.io, ".git/index", arena, .limited(1024 * 1024));
+    // A real staged declaration change arrives after candidate evaluation.
+    const changed_source = "class Source { public int[] values; }\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "Assets/Source.cs", .data = changed_source });
+    try git.ok(&.{ "add", "Assets/Source.cs" });
+    const changed_index = try tmp.dir.readFileAlloc(testing.io, ".git/index", arena, .limited(1024 * 1024));
+    try testing.expectError(error.SourceChanged, install(git, head, .{ .tree = tree, .stages = &.{}, .conflicts = &.{}, .index_before = before }));
+    try testing.expectEqualStrings(original, try tmp.dir.readFileAlloc(testing.io, "Assets/A.prefab", arena, .limited(1024)));
+    try testing.expectEqualStrings(changed_source, try tmp.dir.readFileAlloc(testing.io, "Assets/Source.cs", arena, .limited(1024)));
+    try testing.expectEqualStrings(changed_index, try tmp.dir.readFileAlloc(testing.io, ".git/index", arena, .limited(1024 * 1024)));
 }

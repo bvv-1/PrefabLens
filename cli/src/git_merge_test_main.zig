@@ -523,26 +523,6 @@ fn testConflictStyles(
         try expectCode(merged, 1, "merge with conflict style");
         const expected = try std.fmt.allocPrint(arena, "--- !u!114 &1\nMonoBehaviour:\n<<<<<<<<<<< ours\n  m_Value: 2\n{s}===========\n  m_Value: 3\n>>>>>>>>>>> theirs\n", .{if (std.mem.eql(u8, style, "merge")) "" else "||||||||||| base\n  m_Value: 1\n"});
         try expectFile(io, arena, repo, file.path, expected);
-
-        // Unsupported semantic input still needs markers when native text merging is clean.
-        try writeFile(io, arena, repo, ".git/fallback-base", sequence_base);
-        try writeFile(io, arena, repo, ".git/fallback-ours", sequence_ours);
-        try writeFile(io, arena, repo, ".git/fallback-theirs", sequence_base);
-        const text_merge = try gitRun(io, arena, repo, &.{
-            "merge-file", "-p", ".git/fallback-ours", ".git/fallback-base", ".git/fallback-theirs",
-        });
-        try expectCode(text_merge, 0, "native text merge for unsupported sequence");
-        const fallback = try std.process.run(arena, io, .{
-            .argv = &.{ prefablens, "merge-driver", ".git/fallback-base", ".git/fallback-ours", ".git/fallback-theirs", file.path, "11" },
-            .cwd = .{ .path = repo },
-            .stdout_limit = .limited(1024 * 1024),
-            .stderr_limit = .limited(1024 * 1024),
-            .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(30) } },
-        });
-        try expectCode(fallback, 1, "whole-file semantic fallback");
-        const base_block = if (std.mem.eql(u8, style, "merge")) "" else "||||||||||| base\n" ++ sequence_base;
-        const whole_expected = try std.fmt.allocPrint(arena, "<<<<<<<<<<< ours\n" ++ sequence_ours ++ "{s}===========\n" ++ sequence_base ++ ">>>>>>>>>>> theirs\n", .{base_block});
-        try expectFile(io, arena, repo, ".git/fallback-ours", whole_expected);
     }
 }
 
@@ -586,7 +566,7 @@ pub fn prepareRepository(
     try gitOk(io, arena, repo, &.{ "switch", "-q", "local" });
 }
 
-fn configureHermeticRepository(io: std.Io, arena: std.mem.Allocator, repo: []const u8) !void {
+pub fn configureHermeticRepository(io: std.Io, arena: std.mem.Allocator, repo: []const u8) !void {
     const empty_attributes = try std.fs.path.join(arena, &.{ repo, ".git/prefablens-global-attributes" });
     const empty_excludes = try std.fs.path.join(arena, &.{ repo, ".git/prefablens-global-excludes" });
     const disabled_hooks = try std.fs.path.join(arena, &.{ repo, ".git/prefablens-disabled-hooks" });

@@ -1,4 +1,5 @@
 const std = @import("std");
+const binding = @import("merge_binding.zig");
 const merge_identity = @import("merge_identity.zig");
 const merge_order = @import("merge_order.zig");
 const merge_model = @import("merge_model.zig");
@@ -39,6 +40,7 @@ const SelectedItem = struct {
 };
 
 const ComponentOwnerIndexes = struct {
+    collection_state: ?*binding.State = null,
     base: merge_identity.ComponentOwnerIndex,
     ours: merge_identity.ComponentOwnerIndex,
     theirs: merge_identity.ComponentOwnerIndex,
@@ -87,9 +89,15 @@ pub fn buildSemantic(
     ours: source.ParsedFile,
     theirs: source.ParsedFile,
 ) merge_model.Error!merge_model.MergePlan {
+    return buildSemanticWithContext(arena, base, ours, theirs, .{});
+}
+
+pub fn buildSemanticWithContext(arena: std.mem.Allocator, base: source.ParsedFile, ours: source.ParsedFile, theirs: source.ParsedFile, context: @import("merge_context.zig").Context) merge_model.Error!merge_model.MergePlan {
+    var collection_state: binding.State = .{ .context = context };
     var operations: std.ArrayList(merge_model.Operation) = .empty;
     var atomic_operations: std.ArrayList(merge_model.AtomicOperation) = .empty;
     const component_owners = ComponentOwnerIndexes{
+        .collection_state = &collection_state,
         .base = try merge_identity.componentOwners(arena, base.documents),
         .ours = try merge_identity.componentOwners(arena, ours.documents),
         .theirs = try merge_identity.componentOwners(arena, theirs.documents),
@@ -166,6 +174,7 @@ pub fn buildSemantic(
         .theirs = theirs,
         .operations = try operations.toOwnedSlice(arena),
         .atomic_operations = try atomic_operations.toOwnedSlice(arena),
+        .collections = try collection_state.bindings.toOwnedSlice(arena),
     };
 }
 
@@ -1241,6 +1250,10 @@ fn collectField(
     else
         try std.fmt.allocPrint(arena, "{s}.{s}", .{ parent_path, key });
 
+    const collection_schema = binding.schema(component_owners.collection_state.?.context, document_id, property_path, .{ base_file, ours_file, theirs_file });
+    if ((hasSequence(nodes) or collection_schema.field != null or collection_schema.conflict) and merge_identity.sequenceKind(document_id.class_id, property_path) == null) {
+        return binding.collect(arena, component_owners.collection_state.?, operations, atomic_operations, document_id, property_path, hierarchy_path, .{ .base = nodes.base, .ours = nodes.ours, .theirs = nodes.theirs }, .{ base_file, ours_file, theirs_file });
+    }
     if (hasMap(nodes)) {
         if (hasNonMap(nodes)) return error.UnsupportedStructure;
         if (nodes.base == null or nodes.ours == null or nodes.theirs == null) {
@@ -1402,6 +1415,18 @@ fn collectSequence(
         const base_item = findSequenceItem(items.base, id);
         const ours_item = findSequenceItem(items.ours, id);
         const theirs_item = findSequenceItem(items.theirs, id);
+        if (kind == .prefab_properties) {
+            const item = base_item orelse ours_item orelse theirs_item.?;
+            const path = item.identity.property_path.?;
+            if (std.mem.endsWith(u8, path, ".Array.size") or std.mem.indexOf(u8, path, ".Array.data[") != null) {
+                // The ordinary override merge cannot prove that array indices
+                // still refer to the same inherited items.
+                const base_node = if (base_item) |v| v.node else null;
+                const ours_node = if (ours_item) |v| v.node else null;
+                const theirs_node = if (theirs_item) |v| v.node else null;
+                if (!equalOptional(base_node, ours_node) or !equalOptional(base_node, theirs_node)) return error.UnsupportedStructure;
+            }
+        }
         const membership = decidePresence(base_item != null, ours_item != null, theirs_item != null);
         var selected = selectedItem(base_item, ours_item, theirs_item, membership);
         const delete_edit = base_item != null and ((ours_item == null and theirs_item != null and
@@ -2650,13 +2675,15 @@ test "merge planner: compares the complete object reference" {
     try testing.expectEqual(@as(usize, 1), built.plan.unresolvedCount());
 }
 
-test "merge planner: rejects a changed sequence without a safe identity" {
+test "merge planner: accepts a one-sided ordered sequence edit" {
     const base = "--- !u!114 &1\nMonoBehaviour:\n  m_Unknown:\n  - 1\n  - 2\n";
     const ours = "--- !u!114 &1\nMonoBehaviour:\n  m_Unknown:\n  - 1\n  - 3\n";
     const theirs = "--- !u!114 &1\nMonoBehaviour:\n  m_Unknown:\n  - 1\n  - 2\n";
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    try testing.expectError(error.UnsupportedStructure, @import("merge.zig").build(arena_state.allocator(), base, ours, theirs));
+    var built = try @import("merge.zig").build(arena_state.allocator(), base, ours, theirs);
+    try testing.expectEqual(@as(usize, 0), built.plan.unresolvedCount());
+    try testing.expectEqualStrings(ours, try @import("merge.zig").finish(arena_state.allocator(), &built.plan));
 }
 
 test "merge planner: combines independent component additions" {
@@ -3125,6 +3152,24 @@ test "merge planner: reports conflicting prefab override order" {
         fixture.expected,
         try @import("merge.zig").finish(arena, &built.plan),
     );
+}
+
+test "merge planner: changed collection overrides require unsupported fallback" {
+    var memory = std.heap.ArenaAllocator.init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const merge = @import("merge.zig");
+    const prefix = "--- !u!1001 &1\nPrefabInstance:\n  m_Modification:\n    m_Modifications:\n    - target: {fileID: 40, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}\n      propertyPath: ";
+    // Serialized indices do not prove the identity of inherited array items.
+    // Keep these edits out of the ordinary keyed override merge.
+    for ([_][]const u8{ "items.Array.size", "items.Array.data[0].speed" }) |path| {
+        const base = try std.fmt.allocPrint(arena, "{s}{s}\n      value: 1\n      objectReference: {{fileID: 0}}\n", .{ prefix, path });
+        const changed = try std.mem.replaceOwned(u8, arena, base, "value: 1", "value: 2");
+        try testing.expectError(error.UnsupportedStructure, merge.build(arena, base, base, changed));
+        try testing.expectError(error.UnsupportedStructure, merge.build(arena, base, changed, base));
+        const unchanged = try merge.build(arena, base, base, base);
+        try testing.expectEqualStrings(base, unchanged.partial);
+    }
 }
 
 test "merge planner: rejects a structural override without its object change" {

@@ -4,12 +4,25 @@ const atomic_file = @import("atomic_file.zig");
 const command = @import("command.zig");
 const merge_io = @import("merge_io.zig");
 const merge_fallback = @import("merge_fallback.zig");
+const merge_git = @import("merge_git.zig");
+const session_context = @import("merge_session_context.zig");
+const revision = @import("merge_revision.zig");
 const testing = std.testing;
 
 pub fn run(
     io: std.Io,
     arena: std.mem.Allocator,
     args: command.MergeDriverArgs,
+    stderr: *std.Io.Writer,
+) !u8 {
+    return runWithGit(io, arena, args, null, stderr);
+}
+
+pub fn runWithGit(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    args: command.MergeDriverArgs,
+    git: ?merge_git.Git,
     stderr: *std.Io.Writer,
 ) !u8 {
     const original = merge_io.readLimited(io, arena, args.ours_output) catch
@@ -25,15 +38,30 @@ pub fn run(
         (original.len == 0 or core.isUnityYaml(original)) and
         (theirs.len == 0 or core.isUnityYaml(theirs));
     if (unity) {
-        const built = core.merge.build(arena, base, original, theirs) catch |err| switch (err) {
+        const context = if (git) |repository|
+            inputContext(repository, args.path, .{ .base = base, .ours = original, .theirs = theirs }) catch |err| switch (err) {
+                error.OutOfMemory => return merge_io.reportFailure(stderr, args.path),
+                else => core.merge_context.Context{},
+            }
+        else
+            core.merge_context.Context{};
+        const built = core.merge.buildWithContext(arena, base, original, theirs, context) catch |err| switch (err) {
             error.OutOfMemory => return merge_io.reportFailure(stderr, args.path),
             else => null,
         };
         if (built) |valid| {
             if (valid.plan.unresolvedCount() == 0) {
-                atomic_file.replace(io, arena, args.ours_output, original, valid.partial) catch
-                    return merge_io.reportFailure(stderr, args.path);
-                return 0;
+                // Automatic acceptance needs the same final validation as an
+                // interactive result, including its selected source context.
+                const output = core.merge.finish(arena, &valid.plan) catch |err| switch (err) {
+                    error.OutOfMemory => return merge_io.reportFailure(stderr, args.path),
+                    else => null,
+                };
+                if (output) |bytes| {
+                    atomic_file.replace(io, arena, args.ours_output, original, bytes) catch
+                        return merge_io.reportFailure(stderr, args.path);
+                    return 0;
+                }
             }
         }
     }
@@ -42,6 +70,15 @@ pub fn run(
     atomic_file.replace(io, arena, args.ours_output, original, fallback.bytes) catch
         return merge_io.reportFailure(stderr, args.path);
     return if (fallback.conflicted) 1 else 0;
+}
+
+fn inputContext(git: merge_git.Git, path: []const u8, inputs: session_context.Inputs) !core.merge_context.Context {
+    const revisions = (try session_context.discover(git)) orelse return .{};
+    var store = revision.Store.init(git);
+    defer store.deinit();
+    // A file driver runs before Git selects the candidate tree. The strategy
+    // provides the immutable revisions needed for schema evidence.
+    return (try session_context.bind(&store, revisions, .{ .base = path, .ours = path, .theirs = path }, inputs)) orelse .{};
 }
 
 fn runDriverCase(
@@ -383,15 +420,21 @@ test "merge driver: preserves a commented document" {
     try runDriverCase(base, ours, theirs_commented_document, expected_commented_document, 0);
 }
 
-test "merge driver: uses native text for non-Unity and markers for unsupported Unity" {
+test "merge driver: merges ordered arrays and falls back for keyed shapes" {
     const valid = "--- !u!114 &1\nMonoBehaviour:\n  m_Value: 1\n";
     // A misleading extension must not let non-Unity content reach the merge engine.
     try runDriverCase("not Unity YAML\n", valid, valid, valid, 0);
 
-    // Unknown changed sequences have no safe identity, so even their independent bytes cannot be guessed.
+    // A one-sided ordered edit has a proven result without field type metadata.
     const base = "--- !u!114 &1\nMonoBehaviour:\n  m_Unknown:\n  - 1\n  - 2\n";
     const ours = "--- !u!114 &1\nMonoBehaviour:\n  m_Unknown:\n  - 1\n  - 3\n";
-    try runDriverCase(base, ours, base, "<<<<<<< ours\n" ++ ours ++ "=======\n" ++ base ++ ">>>>>>> theirs\n", 1);
+    try runDriverCase(base, ours, base, ours, 0);
+
+    // A keyed shape remains a whole-field choice because its identity is
+    // outside the supported ordered-array schema.
+    const keyed_base = "--- !u!114 &1\nMonoBehaviour:\n  m_Unknown:\n  - key: A\n    value: 1\n";
+    const keyed_ours = "--- !u!114 &1\nMonoBehaviour:\n  m_Unknown:\n  - key: A\n    value: 2\n";
+    try runDriverCase(keyed_base, keyed_ours, keyed_base, "<<<<<<< ours\n" ++ keyed_ours ++ "=======\n" ++ keyed_base ++ ">>>>>>> theirs\n", 1);
 }
 
 test "merge driver: malformed Unity remains a semantic parse failure" {

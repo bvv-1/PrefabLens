@@ -64,19 +64,78 @@ pub fn main(init: std.process.Init) !u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    try integration.require(args.len == 2, "expected the prefablens executable path");
+    try integration.require(args.len == 2 or (args.len == 3 and std.mem.eql(u8, args[2], "--readiness")), "expected the prefablens executable path and optional --readiness");
     const prefablens = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], arena);
     const scratch = try integration.scratchDirectory(io, arena, "pty");
     defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
 
     try testVisibleLabelAssertion();
+    try testDelayedTerminals(io, arena, scratch, prefablens);
+    if (args.len == 3) return 0;
     try testCompletion(io, arena, scratch, prefablens);
     try testBackspaceBeforeEditing(io, arena, scratch, prefablens);
     try testDeletionChoices(io, arena, scratch, prefablens);
+    try testCollectionChoices(io, arena, scratch, prefablens);
     try testQuit(io, arena, scratch, prefablens);
     try testTimeout(io, arena, scratch, prefablens);
     try std.Io.File.stdout().writeStreamingAll(io, "pty mergetool smoke: passed\n");
     return 0;
+}
+
+fn testCollectionChoices(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+) !void {
+    const cases = [_]struct {
+        name: []const u8,
+        base: []const u8,
+        ours: []const u8,
+        theirs: []const u8,
+        keys: []const u8,
+        expected: []const u8,
+        toggle_keys: ?[]const u8 = null,
+    }{
+        // Both insertion orders must retain each block and the unrelated scalar edits.
+        .{ .name = "collection-ours-first", .base = "[A]", .ours = "[A, O1, O2]", .theirs = "[A, T1, T2]", .toggle_keys = "\x1b[CT", .keys = "\r\r", .expected = "[A, O1, O2, T1, T2]" },
+        .{ .name = "collection-theirs-first", .base = "[A]", .ours = "[A, O1, O2]", .theirs = "[A, T1, T2]", .toggle_keys = "\x1b[C\x1b[116;2u", .keys = "\x1b[C\r\r", .expected = "[A, T1, T2, O1, O2]" },
+        // A second toggle restores the original side before Enter resolves it.
+        .{ .name = "collection-toggle-off", .base = "[A]", .ours = "[A, Ours]", .theirs = "[A, Theirs]", .toggle_keys = "\x1b[CT", .keys = "T\r\r", .expected = "[A, Ours]" },
+        // Retaining the edited C must not restore the independently removed B.
+        .{ .name = "collection-delete-edit", .base = "[A, B, C]", .ours = "[A]", .theirs = "[A, B, Edited]", .keys = "\x1b[C\x1b[C\r\r", .expected = "[A, Edited]" },
+        // A custom interval replaces only the unresolved append gap.
+        .{ .name = "collection-custom", .base = "[A]", .ours = "[A, Ours]", .theirs = "[A, Theirs]", .keys = "\x1b[<0;83;5M[Custom]\r\r", .expected = "[A, Custom]" },
+    };
+    for (cases) |case| {
+        const repo = try prepareMergetoolRepositoryWithSides(io, arena, scratch, prefablens, case.name, .{
+            .path = "Assets/Conflict.prefab",
+            .base = try collectionFile(arena, case.base, 1, 1),
+            .ours = try collectionFile(arena, case.ours, 2, 1),
+            .theirs = try collectionFile(arena, case.theirs, 1, 3),
+        });
+        const merged = try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" });
+        try integration.expectNonzero(merged, "prepare collection conflict");
+        _ = try integration.expectMarkers(io, arena, repo, "Assets/Conflict.prefab");
+        const result = if (case.toggle_keys) |toggle_keys|
+            try runCommandInPtyThreeBatches(io, arena, repo, "git mergetool --no-prompt --tool=prefablens -- Assets/Conflict.prefab", "", toggle_keys, case.keys, 30)
+        else
+            try runMergetoolInPty(io, arena, repo, case.keys, 30);
+        try integration.expectCode(result, 0, "resolve collection in PTY");
+        if (case.toggle_keys != null) {
+            inline for (.{ "Both sides", "Ours + Theirs", "Theirs + Ours" }) |label| {
+                try integration.require(terminalCaptureContains(result.stdout, label), "PTY omitted the combined collection mode");
+            }
+        }
+        try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", try collectionFile(arena, case.expected, 2, 3));
+        const unmerged = try integration.gitRun(io, arena, repo, &.{ "ls-files", "-u" });
+        try integration.expectCode(unmerged, 0, "list index after collection choice");
+        try integration.require(unmerged.stdout.len == 0, "collection choice left unmerged entries");
+    }
+}
+
+fn collectionFile(arena: std.mem.Allocator, items: []const u8, left: u8, right: u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "--- !u!114 &1\nMonoBehaviour:\n  m_Items: {s}\n  m_Left: {d}\n  m_Right: {d}\n", .{ items, left, right });
 }
 
 fn testDeletionChoices(
@@ -91,7 +150,7 @@ fn testDeletionChoices(
         theirs: []const u8,
         keys: []const u8,
     }{
-        // The side choice represents deletion, and the second Enter confirms Complete.
+        // Enter applies the focused deletion choice, then confirms Complete.
         .{ .name = "delete-ours", .ours = map_deleted, .theirs = map_edited, .keys = "\x1b[C\r\r" },
         .{ .name = "delete-theirs", .ours = map_edited, .theirs = map_deleted, .keys = "\x1b[C\x1b[C\r\r" },
     };
@@ -270,6 +329,43 @@ fn applyCsi(
             alternate_active.* = false;
         },
         else => {},
+    }
+}
+
+fn testDelayedTerminals(io: std.Io, arena: std.mem.Allocator, scratch: []const u8, prefablens: []const u8) !void {
+    const first = try prepareMergetoolRepository(io, arena, scratch, prefablens, "delayed-first");
+    const second = try prepareMergetoolRepository(io, arena, scratch, prefablens, "delayed-second");
+    for ([_][]const u8{ first, second }) |repo| {
+        try integration.expectNonzero(try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" }), "prepare delayed terminal conflict");
+    }
+    // Each real mergetool starts after the old fixed two-second key schedule.
+    // The second batch must wait for the second UI, not a redraw of the first.
+    const command = try std.fmt.allocPrint(
+        arena,
+        "sleep 3; git mergetool --no-prompt --tool=prefablens -- Assets/Conflict.prefab && sleep 3 && git -C {s} mergetool --no-prompt --tool=prefablens -- Assets/Conflict.prefab",
+        .{try integration.shellQuote(arena, second)},
+    );
+    const result = try runCommandInPtyBatches(io, arena, first, try std.fmt.allocPrint(arena, "sh -c {s}", .{try integration.shellQuote(arena, command)}), "\x1b[<0;83;5M4\r\r", "\x1b[<0;83;5M5\r\r", 15);
+    try integration.expectCode(result, 0, "delayed terminal batches");
+    const alternate_start = "\x1b[?1049h";
+    var session_start = std.mem.indexOf(u8, result.stdout, alternate_start);
+    var session_count: usize = 0;
+    while (session_start) |start| {
+        const next = std.mem.indexOfPos(u8, result.stdout, start + alternate_start.len, alternate_start);
+        const output = result.stdout[start .. next orelse result.stdout.len];
+        try integration.require(terminalCaptureContains(output, "Assets/Conflict.prefab"), "delayed terminal omitted its file header");
+        session_count += 1;
+        session_start = next;
+    }
+    try integration.require(session_count == 2, "delayed test did not open two terminal sessions");
+    try integration.expectFile(io, arena, first, "Assets/Conflict.prefab", conflict_resolved);
+    try integration.expectFile(io, arena, second, "Assets/Conflict.prefab", try std.mem.replaceOwned(u8, arena, conflict_resolved, "m_Value: 4", "m_Value: 5"));
+    for ([_][]const u8{ first, second }) |repo| {
+        const unmerged = try integration.gitRun(io, arena, repo, &.{ "ls-files", "--unmerged" });
+        try integration.expectCode(unmerged, 0, "delayed terminal index");
+        try integration.require(unmerged.stdout.len == 0, "delayed terminal left conflict stages");
+        try integration.gitOk(io, arena, repo, &.{ "merge", "--abort" });
+        try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", conflict_ours);
     }
 }
 
@@ -474,6 +570,8 @@ pub fn runCommandInPty(
     return runCommandInPtyBatches(io, arena, repository, git_command, input_keys, "", timeout_seconds);
 }
 
+// A nonempty first batch advances to another terminal session before the second.
+// An empty first batch holds the initial UI for concurrent-mutation fixtures.
 pub fn runCommandInPtyBatches(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -483,56 +581,142 @@ pub fn runCommandInPtyBatches(
     second_keys: []const u8,
     timeout_seconds: i64,
 ) !std.process.RunResult {
-    const terminal_command = try integration.shellQuote(arena, try std.fmt.allocPrint(arena, "stty cols 100 rows 24; exec {s}", .{git_command}));
+    return runCommandInPtyThreeBatches(io, arena, repository, git_command, input_keys, second_keys, "", timeout_seconds);
+}
+
+// The third batch continues the second UI after it renders the second batch's result.
+pub fn runCommandInPtyThreeBatches(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    repository: []const u8,
+    git_command: []const u8,
+    input_keys: []const u8,
+    second_keys: []const u8,
+    third_keys: []const u8,
+    timeout_seconds: i64,
+) !std.process.RunResult {
+    var random: [16]u8 = undefined;
+    io.random(&random);
+    const capture = try std.fmt.allocPrint(arena, "/tmp/prefablens-pty-{x}.log", .{random});
+    defer std.Io.Dir.cwd().deleteFile(io, capture) catch {};
+    const completed = try std.fmt.allocPrint(arena, "{s}.done", .{capture});
+    defer std.Io.Dir.cwd().deleteFile(io, completed) catch {};
+    const capture_argument = try integration.shellQuote(arena, capture);
+    const terminal_command = try integration.shellQuote(arena, try std.fmt.allocPrint(arena, "stty cols 100 rows 24; {s}; terminal_status=$?; : > {s}; exit \"$terminal_status\"", .{ git_command, try integration.shellQuote(arena, completed) }));
     const shell_command = switch (builtin.os.tag) {
-        .linux => try std.fmt.allocPrint(arena, "script -qfec {s} /dev/null", .{terminal_command}),
-        .macos => try std.fmt.allocPrint(arena, "script -q /dev/null sh -c {s}", .{terminal_command}),
+        .linux => try std.fmt.allocPrint(arena, "script -qfec {s} {s}", .{ terminal_command, capture_argument }),
+        .macos => try std.fmt.allocPrint(arena, "script -qF {s} sh -c {s}", .{ capture_argument, terminal_command }),
         else => unreachable,
     };
     const command = try std.fmt.allocPrint(
         arena,
-        // Keep the pipe open across raw-mode setup. The DA1 replies let libvaxis finish its
-        // capability query without consuming the actual merge keys before the first draw.
+        // Reply once per Kitty query so capability logs cannot disturb later UI frames.
+        // DA1 must follow keyboard support because it ends capability discovery.
+        // libvaxis needs a DSR reply to stop its input thread.
+        // Keep the minimum delays used by fixtures that mutate state while a UI is open.
         \\(
+        \\capture_file=$4
+        \\keyboard_replies=0
+        \\status_replies=0
+        \\reply_terminal() {{
+        \\  [ ! -e "$capture_file.done" ] || return 1
+        \\  state=$(LC_ALL=C awk {s} "$capture_file" 2>/dev/null)
+        \\  set -- $state
+        \\  if [ "$#" -eq 6 ] && [ "$5" -gt "$keyboard_replies" ]; then
+        \\    printf '\033[?0u\033[?1;2c' || return 1
+        \\    keyboard_replies=$5
+        \\  fi
+        \\  if [ "$#" -eq 6 ] && [ "$6" -gt "$status_replies" ]; then
+        \\    printf '\033[0n' || return 1
+        \\    status_replies=$6
+        \\  fi
+        \\}}
+        \\wait_frame() {{
+        \\  min_session=$1
+        \\  min_frame=$2
+        \\  while :; do
+        \\    reply_terminal || exit 0
+        \\    set -- $state
+        \\    if [ "$#" -eq 6 ] && [ "$4" -eq 1 ] && [ "$3" -eq "$1" ] && [ "$1" -ge "$min_session" ] && [ "$2" -gt "$min_frame" ]; then
+        \\      observed_session=$1
+        \\      observed_frame=$2
+        \\      return
+        \\    fi
+        \\    sleep 0.1
+        \\  done
+        \\}}
         \\i=0
         \\while [ "$i" -lt 10 ]; do
-        \\  printf '\033[?1;2c'
+        \\  reply_terminal || exit 0
         \\  sleep 0.1
         \\  i=$((i + 1))
         \\done
         \\sleep 1
+        \\wait_frame 1 0
+        \\first_session=$observed_session
         \\printf '%s' "$1"
         \\if [ -n "$2" ]; then
         \\  i=0
         \\  while [ "$i" -lt 10 ]; do
-        \\    printf '\033[?1;2c'
+        \\    reply_terminal || exit 0
         \\    sleep 0.1
         \\    i=$((i + 1))
         \\  done
         \\  sleep 1
+        \\  if [ -n "$1" ]; then
+        \\    wait_frame "$((first_session + 1))" 0
+        \\  else
+        \\    wait_frame "$first_session" 0
+        \\  fi
+        \\  second_frame=$observed_frame
+        \\  second_session=$observed_session
         \\  printf '%s' "$2"
+        \\fi
+        \\if [ -n "$3" ]; then
+        \\  sleep 2
+        \\  wait_frame "$second_session" "$second_frame"
+        \\  printf '%s' "$3"
         \\fi
         \\i=0
         \\while [ "$i" -lt 100 ]; do
         \\  sleep 0.1
-        \\  printf '\033[?1;2c' || exit 0
+        \\  reply_terminal || exit 0
         \\  i=$((i + 1))
         \\done
         \\) | TERM=xterm-256color {s} &
         \\pty_pid=$!
-        \\trap 'kill "$pty_pid" 2>/dev/null; wait "$pty_pid" 2>/dev/null; exit 124' HUP INT TERM
+        \\trap ': > "$4.done"; kill "$pty_pid" 2>/dev/null; wait "$pty_pid" 2>/dev/null; exit 124' HUP INT TERM
         \\wait "$pty_pid"
         \\status=$?
         \\trap - HUP INT TERM
         \\exit "$status"
     ,
-        .{shell_command},
+        .{ try integration.shellQuote(arena, frame_probe), shell_command },
     );
     return std.process.run(arena, io, .{
-        .argv = &.{ "sh", "-c", command, "prefablens-keys", input_keys, second_keys },
+        .argv = &.{ "sh", "-c", command, "prefablens-keys", input_keys, second_keys, third_keys, capture },
         .cwd = .{ .path = repository },
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
         .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(timeout_seconds) } },
-    });
+    }) catch |err| {
+        if (err == error.Timeout) {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, capture, arena, .limited(1024 * 1024)) catch "(PTY capture unavailable)";
+            try std.Io.File.stderr().writeStreamingAll(io, bytes);
+        }
+        return err;
+    };
 }
+
+// libvaxis surrounds terminal sessions and synchronized renders with these CSI
+// sequences. A partial frame or a completed frame from an exited UI is not ready.
+const frame_probe =
+    \\BEGIN { RS="\033" }
+    \\/^\[\?1049h/ { session++; active=1; pending=0 }
+    \\/^\[\?1049l/ { active=0; pending=0 }
+    \\/^\[\?2026h/ { if (active) pending=1 }
+    \\/^\[\?2026l/ { if (active && pending) { frames++; complete=session }; pending=0 }
+    \\/^\[\?u/ { keyboards++ }
+    \\/^\[5n/ { reports++ }
+    \\END { print session+0, frames+0, complete+0, active+0, keyboards+0, reports+0 }
+;
