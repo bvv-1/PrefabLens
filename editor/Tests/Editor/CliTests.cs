@@ -15,6 +15,45 @@ namespace PrefabLens.Tests
 {
     public class CliTests
     {
+        static string NativeCliDirectory(string variable = "PREFABLENS_TEST_BIN_DIR")
+        {
+            var dir = Environment.GetEnvironmentVariable(variable);
+            Assert.IsFalse(
+                string.IsNullOrEmpty(dir),
+                $"Set {variable} to a directory that contains the real native CLI executable."
+            );
+            return dir;
+        }
+
+        static void CopyNativeBinary(string sourceDirectory, string name, string destinationDirectory)
+        {
+            Directory.CreateDirectory(destinationDirectory);
+            File.Copy(Path.Combine(sourceDirectory, name), Path.Combine(destinationDirectory, name));
+        }
+
+        static void CopyNativeCli(string sourceDirectory, string destinationDirectory)
+        {
+            CopyNativeBinary(sourceDirectory, Cli.BinaryName, destinationDirectory);
+        }
+
+        static byte[] CreateNativeArchive(string sourceDirectory, params (string SourceName, string EntryName)[] files)
+        {
+            using var buffer = new MemoryStream();
+            using (var zip = new ZipArchive(buffer, ZipArchiveMode.Create, leaveOpen: true))
+            {
+                foreach (var file in files)
+                {
+                    using var source = File.OpenRead(Path.Combine(sourceDirectory, file.SourceName));
+                    using var destination = zip.CreateEntry(file.EntryName).Open();
+                    source.CopyTo(destination);
+                }
+            }
+            return buffer.ToArray();
+        }
+
+        static byte[] CreateNativeCliArchive(string sourceDirectory) =>
+            CreateNativeArchive(sourceDirectory, (Cli.BinaryName, Cli.BinaryName));
+
         [Test]
         public void ReleaseAssetNameCoversAllTargets()
         {
@@ -201,24 +240,65 @@ namespace PrefabLens.Tests
         }
 
         [Test]
-        public void ExtractToWritesEveryZipEntry()
+        public void ExtractToWritesOnlyTheExactNativeCliEntry()
         {
-            // Build a real zip in memory (no fixture files) and extract it into a temp dir.
-            var buffer = new MemoryStream();
-            using (var zip = new ZipArchive(buffer, ZipArchiveMode.Create, leaveOpen: true))
-            {
-                using (var w = new StreamWriter(zip.CreateEntry("prefablens").Open()))
-                    w.Write("binary");
-                using (var w = new StreamWriter(zip.CreateEntry("LICENSE").Open()))
-                    w.Write("apache");
-            }
+            var archive = CreateNativeArchive(
+                NativeCliDirectory(),
+                (Cli.BinaryName, Cli.BinaryName),
+                (Cli.BinaryName, "ignored-command")
+            );
             var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
             Directory.CreateDirectory(dir);
             try
             {
-                Cli.ExtractTo(buffer.ToArray(), dir);
-                Assert.AreEqual("binary", File.ReadAllText(Path.Combine(dir, "prefablens")));
-                Assert.AreEqual("apache", File.ReadAllText(Path.Combine(dir, "LICENSE")));
+                Cli.ExtractTo(archive, dir);
+                CollectionAssert.AreEqual(
+                    File.ReadAllBytes(Path.Combine(NativeCliDirectory(), Cli.BinaryName)),
+                    File.ReadAllBytes(Path.Combine(dir, Cli.BinaryName))
+                );
+                var extracted = Directory.GetFiles(dir);
+                Assert.AreEqual(1, extracted.Length);
+                Assert.AreEqual(Cli.BinaryName, Path.GetFileName(extracted[0]));
+            }
+            finally
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+        }
+
+        [Test]
+        public void ExtractToRejectsAnArchiveWithoutTheExactNativeCliEntry()
+        {
+            var archive = CreateNativeArchive(NativeCliDirectory(), (Cli.BinaryName, "nested/" + Cli.BinaryName));
+            var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var error = Assert.Throws<InvalidOperationException>(() => Cli.ExtractTo(archive, dir));
+                StringAssert.Contains(Cli.BinaryName, error.Message);
+                Assert.IsEmpty(Directory.GetFiles(dir));
+            }
+            finally
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+        }
+
+        [Test]
+        public void MarkExecutableMakesTheRealNativeCliRunnable()
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                Assert.Ignore("chmod is a Unix concern");
+            var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var archive = CreateNativeCliArchive(NativeCliDirectory());
+                Cli.ExtractTo(archive, dir);
+                var cliPath = Path.Combine(dir, Cli.BinaryName);
+                Cli.MarkExecutable(cliPath);
+
+                Assert.AreEqual(0, Cli.RunProcess(cliPath, "--version", dir, 10_000).ExitCode);
             }
             finally
             {
@@ -456,14 +536,13 @@ namespace PrefabLens.Tests
         public void LocateUsesAnExistingOverrideAndReportsNothingMissing()
         {
             var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-            Directory.CreateDirectory(dir);
-            var manual = Path.Combine(dir, "custom-prefablens");
-            File.WriteAllText(manual, "bin");
+            CopyNativeCli(NativeCliDirectory(), dir);
+            var manual = Path.Combine(dir, Cli.BinaryName);
             try
             {
                 var loc = Cli.Locate(manual, Path.Combine(dir, "default-prefablens"));
                 Assert.AreEqual(manual, loc.Path);
-                Assert.IsNull(loc.MissingOverride);
+                Assert.IsNull(loc.OverrideError);
             }
             finally
             {
@@ -472,20 +551,116 @@ namespace PrefabLens.Tests
         }
 
         [Test]
-        public void LocateReportsAMissingOverrideWhileFallingBackToTheDefault()
+        public void LocateUsesAStandaloneDefaultCli()
+        {
+            var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            CopyNativeBinary(NativeCliDirectory(), Cli.BinaryName, dir);
+            var cliPath = Path.Combine(dir, Cli.BinaryName);
+            try
+            {
+                var loc = Cli.Locate("", cliPath);
+                Assert.AreEqual(cliPath, loc.Path);
+            }
+            finally
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+        }
+
+        [Test]
+        public void LocateRejectsADefaultCliFromAnotherRelease()
+        {
+            // The automatic cache belongs to Cli.Version and cannot silently use another release.
+            var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            CopyNativeCli(NativeCliDirectory("PREFABLENS_TEST_ALT_BIN_DIR"), dir);
+            try
+            {
+                var loc = Cli.Locate("", Path.Combine(dir, Cli.BinaryName));
+                Assert.IsNull(loc.Path);
+            }
+            finally
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+        }
+
+        [Test]
+        public void LocateAcceptsAnOverrideFromAnotherRelease()
+        {
+            var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            CopyNativeCli(NativeCliDirectory("PREFABLENS_TEST_ALT_BIN_DIR"), dir);
+            var manual = Path.Combine(dir, Cli.BinaryName);
+            try
+            {
+                var loc = Cli.Locate(manual, Path.Combine(dir, "absent", Cli.BinaryName));
+                Assert.AreEqual(manual, loc.Path);
+                Assert.IsNull(loc.OverrideError);
+            }
+            finally
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+        }
+
+        [Test]
+        public void InstallArchiveInstallsAndRunsTheNativeCli()
+        {
+            // ZIP extraction removes Unix execute bits, so installation must make the CLI executable.
+            var root = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            var finalDirectory = Path.Combine(root, Cli.Version);
+            var archive = CreateNativeCliArchive(NativeCliDirectory());
+            try
+            {
+                var installed = Cli.InstallArchive(archive, finalDirectory, Cli.Version);
+                Assert.AreEqual(Path.Combine(finalDirectory, Cli.BinaryName), installed);
+                Assert.AreEqual(0, Cli.RunProcess(installed, "--version", finalDirectory, 10_000).ExitCode);
+            }
+            finally
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, recursive: true);
+            }
+        }
+
+        [Test]
+        public void InstallArchiveKeepsAUsableCacheWhenTheArchiveHasAnotherVersion()
+        {
+            // Validation must finish in staging before the installer replaces a usable cache.
+            var root = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            var finalDirectory = Path.Combine(root, Cli.Version);
+            CopyNativeCli(NativeCliDirectory(), finalDirectory);
+            var cliPath = Path.Combine(finalDirectory, Cli.BinaryName);
+            var originalCli = File.ReadAllBytes(cliPath);
+            var archive = CreateNativeCliArchive(NativeCliDirectory("PREFABLENS_TEST_ALT_BIN_DIR"));
+            try
+            {
+                Assert.Throws<InvalidOperationException>(() =>
+                    Cli.InstallArchive(archive, finalDirectory, Cli.Version)
+                );
+                CollectionAssert.AreEqual(originalCli, File.ReadAllBytes(cliPath));
+                Assert.AreEqual(cliPath, Cli.Locate("", cliPath).Path);
+            }
+            finally
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
+        [Test]
+        public void LocateReportsAnInvalidOverrideWhileUsingTheDefault()
         {
             // The silent-fallback bug: an override pointing at a deleted binary used to be
             // indistinguishable from "no override set". The state must be reportable.
             var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-            Directory.CreateDirectory(dir);
-            var def = Path.Combine(dir, "default-prefablens");
-            File.WriteAllText(def, "bin");
+            var defaultDirectory = Path.Combine(dir, "default");
+            CopyNativeCli(NativeCliDirectory(), defaultDirectory);
+            var def = Path.Combine(defaultDirectory, Cli.BinaryName);
             var gone = Path.Combine(dir, "gone-prefablens");
             try
             {
                 var loc = Cli.Locate(gone, def);
                 Assert.AreEqual(def, loc.Path);
-                Assert.AreEqual(gone, loc.MissingOverride);
+                StringAssert.Contains(gone, loc.OverrideError);
             }
             finally
             {
@@ -494,53 +669,33 @@ namespace PrefabLens.Tests
         }
 
         [Test]
-        public void LocateReportsAMissingOverrideEvenWhenNothingElseExists()
+        public void LocateReportsAnInvalidOverrideWhenNothingElseExists()
         {
             var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
             var gone = Path.Combine(dir, "gone-prefablens");
             var loc = Cli.Locate(gone, Path.Combine(dir, "default-prefablens"));
             Assert.IsNull(loc.Path);
-            Assert.AreEqual(gone, loc.MissingOverride);
+            StringAssert.Contains(gone, loc.OverrideError);
         }
 
         [Test]
         public void LocateWithoutAnOverrideUsesTheDefaultOrNothing()
         {
             var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-            Directory.CreateDirectory(dir);
-            var def = Path.Combine(dir, "default-prefablens");
-            File.WriteAllText(def, "bin");
+            var defaultDirectory = Path.Combine(dir, "default");
+            CopyNativeCli(NativeCliDirectory(), defaultDirectory);
+            var def = Path.Combine(defaultDirectory, Cli.BinaryName);
             try
             {
                 Assert.AreEqual(def, Cli.Locate("", def).Path);
-                Assert.IsNull(Cli.Locate("", def).MissingOverride);
+                Assert.IsNull(Cli.Locate("", def).OverrideError);
                 var none = Cli.Locate("", Path.Combine(dir, "absent"));
                 Assert.IsNull(none.Path);
-                Assert.IsNull(none.MissingOverride);
+                Assert.IsNull(none.OverrideError);
             }
             finally
             {
                 Directory.Delete(dir, recursive: true);
-            }
-        }
-
-        [Test]
-        public void MarkExecutableMakesARealFileRunnable()
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                Assert.Ignore("chmod is a unix concern");
-            var file = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-            File.WriteAllText(file, "#!/bin/sh\nexit 0\n");
-            try
-            {
-                Cli.MarkExecutable(file);
-                // The proof is execution: a fresh file is not executable until chmod succeeds.
-                var res = Cli.RunProcess(file, "", ".", timeoutMs: 10_000);
-                Assert.AreEqual(0, res.ExitCode);
-            }
-            finally
-            {
-                File.Delete(file);
             }
         }
 
@@ -585,9 +740,8 @@ namespace PrefabLens.Tests
         {
             var original = Cli.PathOverride;
             var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-            Directory.CreateDirectory(dir);
-            var manual = Path.Combine(dir, "prefablens");
-            File.WriteAllText(manual, "bin");
+            CopyNativeCli(NativeCliDirectory(), dir);
+            var manual = Path.Combine(dir, Cli.BinaryName);
             try
             {
                 Cli.PathOverride = manual;

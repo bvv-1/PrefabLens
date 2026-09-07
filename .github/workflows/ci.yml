@@ -16,24 +16,26 @@ concurrency:
 jobs:
   core:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - name: Version sync guard
         if: matrix.os == 'ubuntu-latest'
         run: .github/scripts/check-version-sync.sh
-      - name: Packaging render test
-        # Plain bash + coreutils; folded here so it does not need its own runner
-        if: matrix.os == 'ubuntu-latest'
-        run: cli/pkg/render_test.sh
       - name: Install tools
         uses: jdx/mise-action@v4
       - name: Restore Zig global cache
         # Windows Zig caching was measured as not worth it (see PR #36 context)
         if: matrix.os == 'ubuntu-latest'
         uses: ./.github/actions/setup-zig-cache
+      - name: Packaging render test
+        if: matrix.os != 'windows-latest'
+        run: |
+          zig build -Doptimize=ReleaseSafe --prefix .zig-cache/release-check/native
+          cli/pkg/render_test.sh .zig-cache/release-check/native/bin
       - name: Lint
         run: zig build lint
       - name: Test
@@ -42,6 +44,23 @@ jobs:
         # Windows runners are too noisy; the measurements swing too much, so skip them here
         if: matrix.os == 'ubuntu-latest'
         run: zig build perf
+
+  release-builds:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-macos
+          - x86_64-macos
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-windows
+          - aarch64-windows
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: ./.github/actions/setup-zig-cache
+      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
 
   extension:
     runs-on: ubuntu-latest
@@ -92,8 +111,12 @@ jobs:
         working-directory: extension
         run: pnpm run e2e
 
-  editor:
-    runs-on: ubuntu-latest
+  editor_native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - name: Install tools
@@ -105,6 +128,8 @@ jobs:
           key: ${{ runner.os }}-nuget-${{ hashFiles('editor/**/*.csproj', 'editor/.config/dotnet-tools.json') }}
           restore-keys: |
             ${{ runner.os }}-nuget-
+      - name: Build real CLI test bundles
+        run: zig build test-installation-binaries -Doptimize=ReleaseSafe
       - name: Lint
         working-directory: editor
         run: |
@@ -113,6 +138,19 @@ jobs:
       - name: Test
         working-directory: editor
         run: dotnet test DotNetTests~/Tests
+        env:
+          PREFABLENS_TEST_BIN_DIR: ${{ github.workspace }}/zig-out/bin
+          PREFABLENS_TEST_ALT_BIN_DIR: ${{ github.workspace }}/zig-out/test-alternate-bin
+
+  editor:
+    # Branch protection requires this name. All native editor runs must pass.
+    needs: editor_native
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "$EDITOR_RESULT" = success
+        env:
+          EDITOR_RESULT: ${{ needs.editor_native.result }}
 
   site:
     runs-on: ubuntu-latest

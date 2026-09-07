@@ -1,0 +1,42 @@
+{
+  "cases": [
+    {
+      "name": "array-both-append",
+      "conflict": true,
+      "choice": "ours_first",
+      "names": [
+        "A",
+        "B",
+        "C",
+        "D",
+        "Ours",
+        "Theirs"
+      ]
+    },
+    {
+      "name": "array-separate-insert",
+      "conflict": false,
+      "names": [
+        "Ours",
+        "A",
+        "B",
+        "C",
+        "D",
+        "Theirs"
+      ]
+    },
+    {
+      "name": "int-array-both-append",
+      "conflict": true,
+      "choice": "ours_first",
+      "numbers": [
+        1,
+        2,
+        3,
+        4,
+        10,
+        20
+      ]
+    }
+  ]
+}

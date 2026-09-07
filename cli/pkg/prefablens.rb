@@ -22,10 +22,12 @@ class Prefablens < Formula
   end
 
   def install
-    bin.install "prefablens"
+    bin.install "prefablens", "git-merge-prefablens"
   end
 
   test do
-    assert_match "usage: prefablens", shell_output("#{bin}/prefablens --help")
+    ENV.prepend_path "PATH", bin
+    assert_equal "prefablens #{version}\n", shell_output("#{bin}/prefablens --version")
+    assert_equal "prefablens merge-strategy #{version}\n", shell_output("#{bin}/git-merge-prefablens --version")
   end
 end

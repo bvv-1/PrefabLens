@@ -36,15 +36,17 @@ namespace PrefabLens.Tests
         }
 
         [Test]
-        public void MissingOverrideNoteSurfacesTheBrokenPath()
+        public void OverrideErrorNoteSurfacesTheValidationError()
         {
-            // Same state #196 made reportable: an override pointing at a missing file.
-            var broken = new Cli.Location("Library/PrefabLens/0.7.1/prefablens", "/gone/prefablens");
-            Assert.AreEqual(
-                "Override points at a missing file: /gone/prefablens",
-                PrefabLensSettings.MissingOverrideNote(broken)
+            var broken = new Cli.Location(
+                "Library/PrefabLens/0.7.1/prefablens",
+                "prefablens was not found at '/gone/prefablens'."
             );
-            Assert.IsNull(PrefabLensSettings.MissingOverrideNote(new Cli.Location(null, null)));
+            Assert.AreEqual(
+                "CLI path override is invalid. prefablens was not found at '/gone/prefablens'.",
+                PrefabLensSettings.OverrideErrorNote(broken)
+            );
+            Assert.IsNull(PrefabLensSettings.OverrideErrorNote(new Cli.Location(null, null)));
         }
     }
 }

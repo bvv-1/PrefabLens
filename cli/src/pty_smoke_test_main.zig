@@ -1,0 +1,722 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const integration = @import("git_merge_test_main.zig");
+
+const conflict_base =
+    \\--- !u!114 &1
+    \\MonoBehaviour:
+    \\  m_Value: 1
+++ "\n";
+const conflict_ours =
+    \\--- !u!114 &1
+    \\MonoBehaviour:
+    \\  m_Value: 2
+++ "\n";
+const conflict_theirs =
+    \\--- !u!114 &1
+    \\MonoBehaviour:
+    \\  m_Value: 3
+++ "\n";
+const conflict_resolved =
+    \\--- !u!114 &1
+    \\MonoBehaviour:
+    \\  m_Value: 4
+++ "\n";
+const conflict_empty =
+    \\--- !u!114 &1
+    \\MonoBehaviour:
+    \\  m_Value:
+++ " \n";
+const map_base =
+    \\--- !u!114 &1
+    \\MonoBehaviour:
+    \\  m_Config:
+    \\    value: 1
+    \\  m_After: keep
+++ "\n";
+const map_deleted =
+    \\--- !u!114 &1
+    \\MonoBehaviour:
+    \\  m_After: keep
+++ "\n";
+const map_edited =
+    \\--- !u!114 &1
+    \\MonoBehaviour:
+    \\  m_Config:
+    \\    value: 2
+    \\  m_After: keep
+++ "\n";
+const capture_width = 100;
+const capture_height = 24;
+
+pub fn main(init: std.process.Init) !u8 {
+    const io = init.io;
+    if (builtin.os.tag == .windows) {
+        try std.Io.File.stdout().writeStreamingAll(io, "pty smoke: skipped on Windows\n");
+        return 0;
+    }
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+        try std.Io.File.stdout().writeStreamingAll(io, "pty smoke: skipped on unsupported OS\n");
+        return 0;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    try integration.require(args.len == 2 or (args.len == 3 and std.mem.eql(u8, args[2], "--readiness")), "expected the prefablens executable path and optional --readiness");
+    const prefablens = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], arena);
+    const scratch = try integration.scratchDirectory(io, arena, "pty");
+    defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
+
+    try testVisibleLabelAssertion();
+    try testDelayedTerminals(io, arena, scratch, prefablens);
+    if (args.len == 3) return 0;
+    try testCompletion(io, arena, scratch, prefablens);
+    try testBackspaceBeforeEditing(io, arena, scratch, prefablens);
+    try testDeletionChoices(io, arena, scratch, prefablens);
+    try testCollectionChoices(io, arena, scratch, prefablens);
+    try testQuit(io, arena, scratch, prefablens);
+    try testTimeout(io, arena, scratch, prefablens);
+    try std.Io.File.stdout().writeStreamingAll(io, "pty mergetool smoke: passed\n");
+    return 0;
+}
+
+fn testCollectionChoices(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+) !void {
+    const cases = [_]struct {
+        name: []const u8,
+        base: []const u8,
+        ours: []const u8,
+        theirs: []const u8,
+        keys: []const u8,
+        expected: []const u8,
+        toggle_keys: ?[]const u8 = null,
+    }{
+        // Both insertion orders must retain each block and the unrelated scalar edits.
+        .{ .name = "collection-ours-first", .base = "[A]", .ours = "[A, O1, O2]", .theirs = "[A, T1, T2]", .toggle_keys = "\x1b[CT", .keys = "\r\r", .expected = "[A, O1, O2, T1, T2]" },
+        .{ .name = "collection-theirs-first", .base = "[A]", .ours = "[A, O1, O2]", .theirs = "[A, T1, T2]", .toggle_keys = "\x1b[C\x1b[116;2u", .keys = "\x1b[C\r\r", .expected = "[A, T1, T2, O1, O2]" },
+        // A second toggle restores the original side before Enter resolves it.
+        .{ .name = "collection-toggle-off", .base = "[A]", .ours = "[A, Ours]", .theirs = "[A, Theirs]", .toggle_keys = "\x1b[CT", .keys = "T\r\r", .expected = "[A, Ours]" },
+        // Retaining the edited C must not restore the independently removed B.
+        .{ .name = "collection-delete-edit", .base = "[A, B, C]", .ours = "[A]", .theirs = "[A, B, Edited]", .keys = "\x1b[C\x1b[C\r\r", .expected = "[A, Edited]" },
+        // A custom interval replaces only the unresolved append gap.
+        .{ .name = "collection-custom", .base = "[A]", .ours = "[A, Ours]", .theirs = "[A, Theirs]", .keys = "\x1b[<0;83;5M[Custom]\r\r", .expected = "[A, Custom]" },
+    };
+    for (cases) |case| {
+        const repo = try prepareMergetoolRepositoryWithSides(io, arena, scratch, prefablens, case.name, .{
+            .path = "Assets/Conflict.prefab",
+            .base = try collectionFile(arena, case.base, 1, 1),
+            .ours = try collectionFile(arena, case.ours, 2, 1),
+            .theirs = try collectionFile(arena, case.theirs, 1, 3),
+        });
+        const merged = try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" });
+        try integration.expectNonzero(merged, "prepare collection conflict");
+        _ = try integration.expectMarkers(io, arena, repo, "Assets/Conflict.prefab");
+        const result = if (case.toggle_keys) |toggle_keys|
+            try runCommandInPtyThreeBatches(io, arena, repo, "git mergetool --no-prompt --tool=prefablens -- Assets/Conflict.prefab", "", toggle_keys, case.keys, 30)
+        else
+            try runMergetoolInPty(io, arena, repo, case.keys, 30);
+        try integration.expectCode(result, 0, "resolve collection in PTY");
+        if (case.toggle_keys != null) {
+            inline for (.{ "Both sides", "Ours + Theirs", "Theirs + Ours" }) |label| {
+                try integration.require(terminalCaptureContains(result.stdout, label), "PTY omitted the combined collection mode");
+            }
+        }
+        try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", try collectionFile(arena, case.expected, 2, 3));
+        const unmerged = try integration.gitRun(io, arena, repo, &.{ "ls-files", "-u" });
+        try integration.expectCode(unmerged, 0, "list index after collection choice");
+        try integration.require(unmerged.stdout.len == 0, "collection choice left unmerged entries");
+    }
+}
+
+fn collectionFile(arena: std.mem.Allocator, items: []const u8, left: u8, right: u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "--- !u!114 &1\nMonoBehaviour:\n  m_Items: {s}\n  m_Left: {d}\n  m_Right: {d}\n", .{ items, left, right });
+}
+
+fn testDeletionChoices(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+) !void {
+    const cases = [_]struct {
+        name: []const u8,
+        ours: []const u8,
+        theirs: []const u8,
+        keys: []const u8,
+    }{
+        // Enter applies the focused deletion choice, then confirms Complete.
+        .{ .name = "delete-ours", .ours = map_deleted, .theirs = map_edited, .keys = "\x1b[C\r\r" },
+        .{ .name = "delete-theirs", .ours = map_edited, .theirs = map_deleted, .keys = "\x1b[C\x1b[C\r\r" },
+    };
+    for (cases) |case| {
+        const repo = try prepareMergetoolRepositoryWithSides(
+            io,
+            arena,
+            scratch,
+            prefablens,
+            case.name,
+            .{
+                .path = "Assets/Conflict.prefab",
+                .base = map_base,
+                .ours = case.ours,
+                .theirs = case.theirs,
+            },
+        );
+        const merge = try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" });
+        try integration.expectNonzero(merge, "prepare deletion conflict");
+        _ = try integration.expectMarkers(io, arena, repo, "Assets/Conflict.prefab");
+
+        const result = try runMergetoolInPty(io, arena, repo, case.keys, 30);
+        try integration.expectCode(result, 0, "choose deletion in PTY");
+        try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", map_deleted);
+        const unmerged = try integration.gitRun(io, arena, repo, &.{ "ls-files", "-u" });
+        try integration.expectCode(unmerged, 0, "list index after deletion");
+        try integration.require(unmerged.stdout.len == 0, "deletion choice left unmerged entries");
+    }
+}
+
+fn testVisibleLabelAssertion() !void {
+    const different_rows = "\x1b[?1049hcomponents\x1b[2;1H(1)\x1b[?1049l";
+    try integration.require(
+        !terminalCaptureContains(different_rows, "components (1)"),
+        "PTY label assertion accepted separate rows",
+    );
+
+    const same_row = "\x1b[?1049hcomponents\x1b[1;12H(1)\x1b[?1049l";
+    try integration.require(
+        terminalCaptureContains(same_row, "components (1)"),
+        "PTY label assertion rejected one visible row",
+    );
+
+    const split_buffers =
+        "components " ++
+        "\x1b[?1049h\x1b[1;12H(1)\x1b[?1049l";
+    try integration.require(
+        !terminalCaptureContains(split_buffers, "components (1)"),
+        "PTY label assertion combined primary and alternate screens",
+    );
+}
+
+pub fn terminalCaptureContains(capture: []const u8, needle: []const u8) bool {
+    var cells: [capture_height][capture_width]u8 = undefined;
+    for (&cells) |*screen_row| @memset(screen_row, ' ');
+    var row: usize = 0;
+    var col: usize = 0;
+    var index: usize = 0;
+    var alternate_active = false;
+
+    while (index < capture.len) {
+        const byte = capture[index];
+        if (byte == 0x1b) {
+            index = consumeEscape(capture, index, &row, &col, &cells, &alternate_active);
+            continue;
+        }
+        index += 1;
+        switch (byte) {
+            '\r' => col = 0,
+            '\n' => row = @min(row + 1, capture_height - 1),
+            0x20...0x7e => {
+                if (col < capture_width) {
+                    cells[row][col] = byte;
+                    col += 1;
+                }
+                if (alternate_active and std.mem.indexOf(u8, &cells[row], needle) != null) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn consumeEscape(
+    capture: []const u8,
+    escape_index: usize,
+    row: *usize,
+    col: *usize,
+    cells: *[capture_height][capture_width]u8,
+    alternate_active: *bool,
+) usize {
+    if (escape_index + 1 >= capture.len) return capture.len;
+    return switch (capture[escape_index + 1]) {
+        '[' => consumeCsi(capture, escape_index + 2, row, col, cells, alternate_active),
+        ']', 'P', '_', '^' => consumeControlString(capture, escape_index + 2),
+        else => escape_index + 2,
+    };
+}
+
+fn consumeControlString(capture: []const u8, start: usize) usize {
+    var index = start;
+    while (index < capture.len) : (index += 1) {
+        if (capture[index] == 0x07) return index + 1;
+        if (capture[index] == 0x1b and index + 1 < capture.len and capture[index + 1] == '\\') {
+            return index + 2;
+        }
+    }
+    return capture.len;
+}
+
+fn consumeCsi(
+    capture: []const u8,
+    start: usize,
+    row: *usize,
+    col: *usize,
+    cells: *[capture_height][capture_width]u8,
+    alternate_active: *bool,
+) usize {
+    var params = [_]usize{0} ** 4;
+    var param_count: usize = 1;
+    var index = start;
+    var private_mode = false;
+    while (index < capture.len) : (index += 1) {
+        const byte = capture[index];
+        switch (byte) {
+            '0'...'9' => {
+                const param = &params[param_count - 1];
+                param.* = param.* * 10 + byte - '0';
+            },
+            ';' => {
+                if (param_count < params.len) param_count += 1;
+            },
+            '?' => private_mode = true,
+            0x40...0x7e => {
+                applyCsi(byte, params, param_count, private_mode, row, col, cells, alternate_active);
+                return index + 1;
+            },
+            else => {},
+        }
+    }
+    return capture.len;
+}
+
+fn applyCsi(
+    command: u8,
+    params: [4]usize,
+    param_count: usize,
+    private_mode: bool,
+    row: *usize,
+    col: *usize,
+    cells: *[capture_height][capture_width]u8,
+    alternate_active: *bool,
+) void {
+    const first = if (params[0] == 0) 1 else params[0];
+    const second = if (param_count < 2 or params[1] == 0) 1 else params[1];
+    switch (command) {
+        'H', 'f' => {
+            row.* = @min(first - 1, capture_height - 1);
+            col.* = @min(second - 1, capture_width - 1);
+        },
+        'G' => col.* = @min(first - 1, capture_width - 1),
+        'd' => row.* = @min(first - 1, capture_height - 1),
+        'A' => row.* -|= first,
+        'B' => row.* = @min(row.* + first, capture_height - 1),
+        'C' => col.* = @min(col.* + first, capture_width - 1),
+        'D' => col.* -|= first,
+        'J' => for (cells) |*screen_row| @memset(screen_row, ' '),
+        'K' => @memset(&cells[row.*], ' '),
+        'h' => if (private_mode and params[0] == 1049) {
+            for (cells) |*screen_row| @memset(screen_row, ' ');
+            row.* = 0;
+            col.* = 0;
+            alternate_active.* = true;
+        },
+        'l' => if (private_mode and params[0] == 1049) {
+            alternate_active.* = false;
+        },
+        else => {},
+    }
+}
+
+fn testDelayedTerminals(io: std.Io, arena: std.mem.Allocator, scratch: []const u8, prefablens: []const u8) !void {
+    const first = try prepareMergetoolRepository(io, arena, scratch, prefablens, "delayed-first");
+    const second = try prepareMergetoolRepository(io, arena, scratch, prefablens, "delayed-second");
+    for ([_][]const u8{ first, second }) |repo| {
+        try integration.expectNonzero(try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" }), "prepare delayed terminal conflict");
+    }
+    // Each real mergetool starts after the old fixed two-second key schedule.
+    // The second batch must wait for the second UI, not a redraw of the first.
+    const command = try std.fmt.allocPrint(
+        arena,
+        "sleep 3; git mergetool --no-prompt --tool=prefablens -- Assets/Conflict.prefab && sleep 3 && git -C {s} mergetool --no-prompt --tool=prefablens -- Assets/Conflict.prefab",
+        .{try integration.shellQuote(arena, second)},
+    );
+    const result = try runCommandInPtyBatches(io, arena, first, try std.fmt.allocPrint(arena, "sh -c {s}", .{try integration.shellQuote(arena, command)}), "\x1b[<0;83;5M4\r\r", "\x1b[<0;83;5M5\r\r", 15);
+    try integration.expectCode(result, 0, "delayed terminal batches");
+    const alternate_start = "\x1b[?1049h";
+    var session_start = std.mem.indexOf(u8, result.stdout, alternate_start);
+    var session_count: usize = 0;
+    while (session_start) |start| {
+        const next = std.mem.indexOfPos(u8, result.stdout, start + alternate_start.len, alternate_start);
+        const output = result.stdout[start .. next orelse result.stdout.len];
+        try integration.require(terminalCaptureContains(output, "Assets/Conflict.prefab"), "delayed terminal omitted its file header");
+        session_count += 1;
+        session_start = next;
+    }
+    try integration.require(session_count == 2, "delayed test did not open two terminal sessions");
+    try integration.expectFile(io, arena, first, "Assets/Conflict.prefab", conflict_resolved);
+    try integration.expectFile(io, arena, second, "Assets/Conflict.prefab", try std.mem.replaceOwned(u8, arena, conflict_resolved, "m_Value: 4", "m_Value: 5"));
+    for ([_][]const u8{ first, second }) |repo| {
+        const unmerged = try integration.gitRun(io, arena, repo, &.{ "ls-files", "--unmerged" });
+        try integration.expectCode(unmerged, 0, "delayed terminal index");
+        try integration.require(unmerged.stdout.len == 0, "delayed terminal left conflict stages");
+        try integration.gitOk(io, arena, repo, &.{ "merge", "--abort" });
+        try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", conflict_ours);
+    }
+}
+
+fn testCompletion(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+) !void {
+    const repo = try prepareMergetoolRepository(io, arena, scratch, prefablens, "complete");
+    const merge = try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" });
+    try integration.expectNonzero(merge, "prepare mergetool completion conflict");
+    const markers = try integration.expectMarkers(io, arena, repo, "Assets/Conflict.prefab");
+
+    // The mouse click focuses Result. The first key starts editing and replaces the value.
+    // The first Enter applies Result. The second Enter confirms Complete.
+    const result = runMergetoolInPty(io, arena, repo, "\x1b[<0;83;5M4\r\r", 30) catch |err| {
+        if (err == error.Timeout) {
+            // A timed-out TUI must leave the original conflict markers available.
+            try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", markers);
+            return error.PtyMergetoolTimeout;
+        }
+        return err;
+    };
+    try integration.expectCode(result, 0, "complete mergetool in PTY");
+    inline for (.{ "components (1)", "Result" }) |text| {
+        try integration.require(
+            terminalCaptureContains(result.stdout, text),
+            "PTY output omitted merge screen text",
+        );
+    }
+    inline for (.{ "Hierarchy", "Inspector", "Apply result", "[ Quit ]" }) |text| {
+        try integration.require(
+            !terminalCaptureContains(result.stdout, text),
+            "PTY output included a removed pane title",
+        );
+    }
+    try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", conflict_resolved);
+
+    const unmerged = try integration.gitRun(io, arena, repo, &.{ "ls-files", "-u" });
+    try integration.expectCode(unmerged, 0, "list index after mergetool");
+    try integration.require(unmerged.stdout.len == 0, "successful mergetool left unmerged entries");
+    const continued = try integration.gitRun(
+        io,
+        arena,
+        repo,
+        &.{ "-c", "core.editor=true", "merge", "--continue" },
+    );
+    try integration.expectCode(continued, 0, "continue merge after mergetool");
+    try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", conflict_resolved);
+
+    const head = try integration.gitRun(io, arena, repo, &.{ "rev-list", "--parents", "-n", "1", "HEAD" });
+    try integration.expectCode(head, 0, "inspect merge commit");
+    var fields = std.mem.tokenizeAny(u8, head.stdout, " \t\r\n");
+    var count: usize = 0;
+    while (fields.next() != null) count += 1;
+    try integration.require(count == 3, "merge --continue did not create a two-parent commit");
+}
+
+fn testBackspaceBeforeEditing(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+) !void {
+    const repo = try prepareMergetoolRepository(io, arena, scratch, prefablens, "backspace");
+    const merge = try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" });
+    try integration.expectNonzero(merge, "prepare mergetool Backspace conflict");
+    _ = try integration.expectMarkers(io, arena, repo, "Assets/Conflict.prefab");
+
+    // A raw DEL byte is the macOS Delete key and must work before a Result click.
+    // Enter opens the dialog. Right and Enter apply the empty value. The final Enter confirms Complete.
+    const keys = "\x1b[C\r\x1b[A\x1b[C\x1b[C\x1b[C\x7f\r\x1b[C\r\r";
+    const result = try runMergetoolInPty(io, arena, repo, keys, 30);
+    try integration.expectCode(result, 0, "clear focused Result in PTY");
+    try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", conflict_empty);
+
+    const unmerged = try integration.gitRun(io, arena, repo, &.{ "ls-files", "-u" });
+    try integration.expectCode(unmerged, 0, "list index after empty Result");
+    try integration.require(unmerged.stdout.len == 0, "empty Result left unmerged entries");
+}
+
+fn testQuit(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+) !void {
+    const repo = try prepareMergetoolRepository(io, arena, scratch, prefablens, "quit");
+    const merge = try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" });
+    try integration.expectNonzero(merge, "prepare mergetool quit conflict");
+    const markers = try integration.expectMarkers(io, arena, repo, "Assets/Conflict.prefab");
+
+    // Quit must leave both the merge output and Git's conflict state untouched.
+    const result = runMergetoolInPty(io, arena, repo, "\x1b[27uy", 30) catch |err| {
+        if (err == error.Timeout) {
+            // Timeout cleanup is verified against the exact markers before failing.
+            try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", markers);
+            return error.PtyMergetoolTimeout;
+        }
+        return err;
+    };
+    try integration.expectCode(result, 1, "quit mergetool in PTY");
+    try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", markers);
+    try integration.require(
+        std.mem.indexOf(u8, result.stdout, "Abort") == null and
+            std.mem.indexOf(u8, result.stderr, "Abort") == null,
+        "PTY output included Abort",
+    );
+
+    const unmerged = try integration.gitRun(
+        io,
+        arena,
+        repo,
+        &.{ "ls-files", "-u", "--", "Assets/Conflict.prefab" },
+    );
+    try integration.expectCode(unmerged, 0, "list index after Quit");
+    var entries = std.mem.tokenizeScalar(u8, unmerged.stdout, '\n');
+    var count: usize = 0;
+    while (entries.next() != null) count += 1;
+    try integration.require(count == 3, "Quit changed Git's conflict stages");
+}
+
+fn testTimeout(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+) !void {
+    const repo = try prepareMergetoolRepository(io, arena, scratch, prefablens, "timeout");
+    const merge = try integration.gitRun(io, arena, repo, &.{ "merge", "--no-edit", "remote" });
+    try integration.expectNonzero(merge, "prepare mergetool timeout conflict");
+    const markers = try integration.expectMarkers(io, arena, repo, "Assets/Conflict.prefab");
+
+    _ = runMergetoolInPty(io, arena, repo, "", 3) catch |err| switch (err) {
+        error.Timeout => {
+            // A successful abort proves that the timed-out mergetool released Git's merge state.
+            try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", markers);
+            try integration.gitOk(io, arena, repo, &.{ "merge", "--abort" });
+            try integration.expectFile(io, arena, repo, "Assets/Conflict.prefab", conflict_ours);
+            return;
+        },
+        else => return err,
+    };
+    return error.ExpectedPtyTimeout;
+}
+
+fn prepareMergetoolRepository(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+    name: []const u8,
+) ![]const u8 {
+    return prepareMergetoolRepositoryWithSides(io, arena, scratch, prefablens, name, .{
+        .path = "Assets/Conflict.prefab",
+        .base = conflict_base,
+        .ours = conflict_ours,
+        .theirs = conflict_theirs,
+    });
+}
+
+fn prepareMergetoolRepositoryWithSides(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    scratch: []const u8,
+    prefablens: []const u8,
+    name: []const u8,
+    file: integration.FileSides,
+) ![]const u8 {
+    const repo = try std.fs.path.join(arena, &.{ scratch, name });
+    const files = [_]integration.FileSides{file};
+    try integration.prepareRepository(io, arena, repo, prefablens, .local, &files);
+    const tool = try std.fmt.allocPrint(
+        arena,
+        "{s} mergetool \"$BASE\" \"$LOCAL\" \"$REMOTE\" \"$MERGED\"",
+        .{try integration.shellQuote(arena, prefablens)},
+    );
+    try integration.gitOk(io, arena, repo, &.{ "config", "mergetool.prefablens.cmd", tool });
+    try integration.gitOk(io, arena, repo, &.{ "config", "mergetool.prefablens.trustExitCode", "true" });
+    return repo;
+}
+
+fn runMergetoolInPty(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    repository: []const u8,
+    input_keys: []const u8,
+    timeout_seconds: i64,
+) !std.process.RunResult {
+    return runCommandInPty(io, arena, repository, "git mergetool --no-prompt --tool=prefablens -- Assets/Conflict.prefab", input_keys, timeout_seconds);
+}
+
+pub fn runCommandInPty(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    repository: []const u8,
+    git_command: []const u8,
+    input_keys: []const u8,
+    timeout_seconds: i64,
+) !std.process.RunResult {
+    return runCommandInPtyBatches(io, arena, repository, git_command, input_keys, "", timeout_seconds);
+}
+
+// A nonempty first batch advances to another terminal session before the second.
+// An empty first batch holds the initial UI for concurrent-mutation fixtures.
+pub fn runCommandInPtyBatches(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    repository: []const u8,
+    git_command: []const u8,
+    input_keys: []const u8,
+    second_keys: []const u8,
+    timeout_seconds: i64,
+) !std.process.RunResult {
+    return runCommandInPtyThreeBatches(io, arena, repository, git_command, input_keys, second_keys, "", timeout_seconds);
+}
+
+// The third batch continues the second UI after it renders the second batch's result.
+pub fn runCommandInPtyThreeBatches(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    repository: []const u8,
+    git_command: []const u8,
+    input_keys: []const u8,
+    second_keys: []const u8,
+    third_keys: []const u8,
+    timeout_seconds: i64,
+) !std.process.RunResult {
+    var random: [16]u8 = undefined;
+    io.random(&random);
+    const capture = try std.fmt.allocPrint(arena, "/tmp/prefablens-pty-{x}.log", .{random});
+    defer std.Io.Dir.cwd().deleteFile(io, capture) catch {};
+    const completed = try std.fmt.allocPrint(arena, "{s}.done", .{capture});
+    defer std.Io.Dir.cwd().deleteFile(io, completed) catch {};
+    const capture_argument = try integration.shellQuote(arena, capture);
+    const terminal_command = try integration.shellQuote(arena, try std.fmt.allocPrint(arena, "stty cols 100 rows 24; {s}; terminal_status=$?; : > {s}; exit \"$terminal_status\"", .{ git_command, try integration.shellQuote(arena, completed) }));
+    const shell_command = switch (builtin.os.tag) {
+        .linux => try std.fmt.allocPrint(arena, "script -qfec {s} {s}", .{ terminal_command, capture_argument }),
+        .macos => try std.fmt.allocPrint(arena, "script -qF {s} sh -c {s}", .{ capture_argument, terminal_command }),
+        else => unreachable,
+    };
+    const command = try std.fmt.allocPrint(
+        arena,
+        // Reply once per Kitty query so capability logs cannot disturb later UI frames.
+        // DA1 must follow keyboard support because it ends capability discovery.
+        // libvaxis needs a DSR reply to stop its input thread.
+        // Keep the minimum delays used by fixtures that mutate state while a UI is open.
+        \\(
+        \\capture_file=$4
+        \\keyboard_replies=0
+        \\status_replies=0
+        \\reply_terminal() {{
+        \\  [ ! -e "$capture_file.done" ] || return 1
+        \\  state=$(LC_ALL=C awk {s} "$capture_file" 2>/dev/null)
+        \\  set -- $state
+        \\  if [ "$#" -eq 6 ] && [ "$5" -gt "$keyboard_replies" ]; then
+        \\    printf '\033[?0u\033[?1;2c' || return 1
+        \\    keyboard_replies=$5
+        \\  fi
+        \\  if [ "$#" -eq 6 ] && [ "$6" -gt "$status_replies" ]; then
+        \\    printf '\033[0n' || return 1
+        \\    status_replies=$6
+        \\  fi
+        \\}}
+        \\wait_frame() {{
+        \\  min_session=$1
+        \\  min_frame=$2
+        \\  while :; do
+        \\    reply_terminal || exit 0
+        \\    set -- $state
+        \\    if [ "$#" -eq 6 ] && [ "$4" -eq 1 ] && [ "$3" -eq "$1" ] && [ "$1" -ge "$min_session" ] && [ "$2" -gt "$min_frame" ]; then
+        \\      observed_session=$1
+        \\      observed_frame=$2
+        \\      return
+        \\    fi
+        \\    sleep 0.1
+        \\  done
+        \\}}
+        \\i=0
+        \\while [ "$i" -lt 10 ]; do
+        \\  reply_terminal || exit 0
+        \\  sleep 0.1
+        \\  i=$((i + 1))
+        \\done
+        \\sleep 1
+        \\wait_frame 1 0
+        \\first_session=$observed_session
+        \\printf '%s' "$1"
+        \\if [ -n "$2" ]; then
+        \\  i=0
+        \\  while [ "$i" -lt 10 ]; do
+        \\    reply_terminal || exit 0
+        \\    sleep 0.1
+        \\    i=$((i + 1))
+        \\  done
+        \\  sleep 1
+        \\  if [ -n "$1" ]; then
+        \\    wait_frame "$((first_session + 1))" 0
+        \\  else
+        \\    wait_frame "$first_session" 0
+        \\  fi
+        \\  second_frame=$observed_frame
+        \\  second_session=$observed_session
+        \\  printf '%s' "$2"
+        \\fi
+        \\if [ -n "$3" ]; then
+        \\  sleep 2
+        \\  wait_frame "$second_session" "$second_frame"
+        \\  printf '%s' "$3"
+        \\fi
+        \\i=0
+        \\while [ "$i" -lt 100 ]; do
+        \\  sleep 0.1
+        \\  reply_terminal || exit 0
+        \\  i=$((i + 1))
+        \\done
+        \\) | TERM=xterm-256color {s} &
+        \\pty_pid=$!
+        \\trap ': > "$4.done"; kill "$pty_pid" 2>/dev/null; wait "$pty_pid" 2>/dev/null; exit 124' HUP INT TERM
+        \\wait "$pty_pid"
+        \\status=$?
+        \\trap - HUP INT TERM
+        \\exit "$status"
+    ,
+        .{ try integration.shellQuote(arena, frame_probe), shell_command },
+    );
+    return std.process.run(arena, io, .{
+        .argv = &.{ "sh", "-c", command, "prefablens-keys", input_keys, second_keys, third_keys, capture },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(timeout_seconds) } },
+    }) catch |err| {
+        if (err == error.Timeout) {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, capture, arena, .limited(1024 * 1024)) catch "(PTY capture unavailable)";
+            try std.Io.File.stderr().writeStreamingAll(io, bytes);
+        }
+        return err;
+    };
+}
+
+// libvaxis surrounds terminal sessions and synchronized renders with these CSI
+// sequences. A partial frame or a completed frame from an exited UI is not ready.
+const frame_probe =
+    \\BEGIN { RS="\033" }
+    \\/^\[\?1049h/ { session++; active=1; pending=0 }
+    \\/^\[\?1049l/ { active=0; pending=0 }
+    \\/^\[\?2026h/ { if (active) pending=1 }
+    \\/^\[\?2026l/ { if (active && pending) { frames++; complete=session }; pending=0 }
+    \\/^\[\?u/ { keyboards++ }
+    \\/^\[5n/ { reports++ }
+    \\END { print session+0, frames+0, complete+0, active+0, keyboards+0, reports+0 }
+;

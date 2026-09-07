@@ -4,46 +4,81 @@
 [![Release](https://img.shields.io/github/v/release/hashiiiii/PrefabLens)](https://github.com/hashiiiii/PrefabLens/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/hashiiiii/PrefabLens/ci.yml?branch=main&label=CI)](https://github.com/hashiiiii/PrefabLens/actions/workflows/ci.yml)
 
-PrefabLens shows human readable diffs of UnityYAML assets.
-A semantic diff shows changes at the GameObject, component, and field level.
+PrefabLens shows semantic diffs for UnityYAML assets.
+It shows changes to GameObjects, components, and fields.
 
-A [live demo](https://prefablens.hashiiiii.workers.dev/) is available.
+Use the [Chrome extension](#chrome-extension), [Unity Editor package](#unity-editor), or [CLI](#cli).
+Try the [live demo](https://prefablens.hashiiiii.workers.dev/).
 
-## Chrome extension (Chrome Web Store)
+## Chrome extension
+
+The extension shows semantic diffs on GitHub pull requests.
+It works only on `github.com`.
 
 <p align="center">
-  <img width="924" src="docs/images/extension.png" alt="extension" />
+  <img width="924" src="docs/images/extension.png" alt="Semantic diff in a GitHub pull request" />
 </p>
+
+Install the extension from the [Chrome Web Store](https://chromewebstore.google.com/detail/dlhnalbfkikchkfedfneiimadommcnip).
+
+You can sign in from the diff panel with GitHub Device Flow.
+You do not need to set a token.
 
 ## Unity Editor
 
 <p align="center">
-  <img width="924" src="docs/images/editor.png" alt="editor" />
+  <img width="924" src="docs/images/editor.png" alt="Semantic diff in the Unity Editor" />
 </p>
+
+The package requires Unity 2022.3 or later.
+
+### Installation
+
+Install from OpenUPM:
+
+```bash
+openupm add com.hashiiiii.prefablens
+```
+
+If you do not use [openupm-cli](https://github.com/openupm/openupm-cli), follow the scoped registry instructions on the [package page](https://openupm.com/packages/com.hashiiiii.prefablens/).
+Alternatively, install the package from this Git URL in the Package Manager:
+
+`https://github.com/hashiiiii/PrefabLens.git?path=editor`
+
+### Usage
+
+Open `Window > PrefabLens`.
+
+The left pane lists every UnityYAML asset that differs from the Git reference in **Base**.
+If **Base** is empty, the window uses HEAD.
+The right pane shows the semantic diff for the selected asset.
+
+The window refreshes when it gains focus.
+Click **Refresh** to refresh it.
+
+On first use, the package downloads a pinned CLI archive from GitHub Releases.
+The package extracts only `prefablens` into `Library/PrefabLens/<version>/`.
+On Windows, the filename is `prefablens.exe`.
+Git does not track `Library/PrefabLens/`.
+
+To use a local CLI:
+
+1. Open Preferences > PrefabLens.
+2. Set **CLI path override** to the absolute path of `prefablens`.
+
+Alternatively, set the `PrefabLens.CliPath` EditorPrefs key to an absolute path.
+
+The CLI must run and report its version.
+A local CLI can use a version other than the pinned version.
+If the override is invalid, PrefabLens uses a valid downloaded CLI or offers a download.
 
 ## CLI
 
 <p align="center">
-  <img width="924" src="docs/images/cli.png" alt="cli" />
+  <img width="924" src="docs/images/cli.png" alt="Semantic diff in the CLI" />
 </p>
 
-## Components
-
-| Directory    | Description                                                                              |
-| ------------ | ---------------------------------------------------------------------------------------- |
-| `core/`      | Zig diff engine for the CLI and WASM                                                     |
-| `cli/`       | `prefablens` CLI tool                                                                    |
-| `extension/` | Chrome extension. The extension shows semantic diffs on GitHub pull requests.            |
-| `editor/`    | Unity Editor package for semantic diffs                                                  |
-| `site/`      | Live demo on Cloudflare Workers. The demo uses artifacts from the CLI and the extension. |
-
-## Installation
-
-### Chrome extension (Chrome Web Store)
-
-Install the extension from the [Chrome Web Store](https://chromewebstore.google.com/detail/dlhnalbfkikchkfedfneiimadommcnip).
-
-### CLI
+### Installation
 
 #### Homebrew (macOS / Linux)
 
@@ -66,119 +101,148 @@ mise use -g github:hashiiiii/PrefabLens
 
 #### Manual
 
-Download the zip for your platform from [GitHub Releases](https://github.com/hashiiiii/PrefabLens/releases).
+Download the ZIP archive for your platform from [GitHub Releases](https://github.com/hashiiiii/PrefabLens/releases).
+Each archive contains one native `prefablens` executable and the `git-merge-prefablens` script.
 
-### Unity Editor package (OpenUPM)
+Git needs the script name to select the PrefabLens merge strategy.
+Git for Windows reads the script's first line (the shebang) and runs the script with `sh`.
 
-Unity `2022.3+` is required.
+If you replace an older manual installation on Windows, remove `git-merge-prefablens.exe`.
+Git can run the old executable instead of the new script.
+Scoop removes its old `git-merge-prefablens` shim during `scoop update prefablens`.
 
-```bash
-openupm add com.hashiiiii.prefablens
-```
-
-If you do not use [openupm-cli](https://github.com/openupm/openupm-cli), add the scoped registry as described on the [package page](https://openupm.com/packages/com.hashiiiii.prefablens/).
-Alternatively, in the Package Manager, install from the git URL `https://github.com/hashiiiii/PrefabLens.git?path=editor`.
-
-## Usage
-
-### Chrome extension
-
-The extension shows human readable diffs of UnityYAML assets on GitHub pull requests.
-You can authenticate with the GitHub Device Flow from the diff panel.
-You do not need to set a token.
-
-> [!NOTE]
-> The extension works on github.com only.
-
-### CLI
+### Usage
 
 ```bash
-prefablens                              # HEAD vs working tree, all changed Unity files
+prefablens                              # HEAD vs working tree, all changed UnityYAML files
 prefablens Assets/Foo.prefab            # HEAD vs working tree, one file
-prefablens main                         # ref vs working tree, all changed Unity files
+prefablens main                         # ref vs working tree, all changed UnityYAML files
 prefablens HEAD~1 HEAD Assets/Foo.prefab  # ref vs ref, one file
-prefablens before.prefab after.prefab   # plain two-file compare (no git)
+prefablens before.prefab after.prefab   # plain comparison of two files
 
 prefablens --json before.prefab after.prefab
 prefablens --html main                  # self-contained HTML report on stdout
 prefablens --open main                  # write the report to a temp file and open it
 ```
 
-Operands with a Unity YAML extension (`.prefab`, `.unity`, `.asset`, and more) are paths.
-All other operands are git refs.
+Operands with a UnityYAML extension (`.prefab`, `.unity`, `.asset`, and more) are paths.
+All other operands are Git references (refs).
 
-The project must use text asset serialization (Edit > Project Settings > Editor >
-Asset Serialization > Force Text).
-Binary-serialized assets do not produce useful diffs.
+### Git merge
 
-### Unity Editor
+PrefabLens uses Git **2.39** or later to resolve UnityYAML conflicts during `git merge`.
 
-Requirements:
+Install `prefablens` and the packaged `git-merge-prefablens` script on `PATH`.
+The script runs `prefablens merge-strategy`.
 
-- Unity 2022.3 or newer
-- The project is inside a git repository
-- Text asset serialization (Force Text)
+For a single clone, run:
 
-Open `Window > PrefabLens`.
+```bash
+prefablens setup-merge
+```
 
-The left pane lists every changed UnityYAML asset against the **Base** ref.
-An empty **Base** ref means HEAD.
-The right pane shows the semantic diff for the selected asset.
-The window refreshes on focus.
-The **Refresh** control also refreshes the window.
+This command adds local Git configuration for the repository.
+It also adds UnityYAML attributes to `.git/info/attributes`.
 
-On first use, the package downloads the pinned `prefablens` CLI from GitHub
-Releases into `Library/PrefabLens/`.
-Git does not track this directory.
+For a team, use shared attributes:
 
-To use a local binary:
+```bash
+prefablens setup-merge --team
+```
 
-1. Open Preferences > PrefabLens.
-2. Set **CLI path override** to an absolute path.
+Commit the generated `.gitattributes`.
 
-Alternatively, set the `PrefabLens.CliPath` EditorPrefs key to an absolute path.
+Each clone requires this setup command once.
+This setup keeps existing attributes and unrelated Git configuration.
 
-| Symptom                                               | What to do                                                                                         |
-| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `Download failed: …`                                  | Retry. If the retry fails, download the release zip. Then set the CLI path override.               |
-| `prefablens exited with N` / one-line CLI error       | Make sure that the project is in a git repository. Make sure that git finishes within the timeout. |
-| `Could not parse CLI output (CLI version mismatch?):` | Clear the CLI path override. Or update the binary.                                                 |
-| `prefablens timed out after 90s and was killed`       | Make sure that `git status` is fast in the repository.                                             |
-| Changed assets never appear                           | Switch Asset Serialization to Force Text.                                                          |
+Use the normal merge command:
 
-## Supported files
+```bash
+git merge origin/main
+```
 
-PrefabLens supports text-serialized Unity assets.
-The supported extensions are `.prefab`, `.unity`, `.asset`, `.mat`, `.anim`, and `.controller`.
-PrefabLens does not support `.meta`, `.asmdef`, or other formats that are not UnityYAML.
+PrefabLens merges independent UnityYAML changes automatically.
+If a UnityYAML conflict remains, the merge UI opens when a terminal is available.
+
+Resolve the remaining conflicts, then select **Complete**.
+
+For array insertion conflicts, focus **Ours** or **Theirs**.
+Press **Shift + T** to switch between **One side** and **Both sides**.
+Use the arrow keys to choose **Ours + Theirs** or **Theirs + Ours**, then press **Enter** to apply that order.
+See [collection merges](docs/collection-merge.md) for supported array behavior and unsupported collection shapes.
 
 ## Development
 
 Install [mise](https://mise.jdx.dev/).
+The toolchain uses Zig 0.16, Node 24, pnpm 12, and .NET 10.
 
-The toolchain is Zig 0.16, Node 24, pnpm 11, and .NET 10.
+Install the toolchain from the repository root:
 
 ```bash
 mise install
-
-# Core / CLI
-zig build test
-zig build run -- before.prefab after.prefab
-
-# WASM (for the extension)
-zig build wasm
-
-# Extension (build / test run zig build wasm when needed)
-cd extension && pnpm install && pnpm run build && pnpm test
-
-# Editor (EditMode tests run on .NET, no Unity required)
-cd editor && dotnet test DotNetTests~/Tests
-
-# Site (build the CLI, WASM, and extension demo bundle first: `pnpm run demo`)
-cd site && node build.mjs
 ```
 
-Related documents:
+### Repository layout
+
+| Directory    | Description                                                        |
+| ------------ | ------------------------------------------------------------------ |
+| `core/`      | Zig semantic diff engine for the CLI and WASM                      |
+| `cli/`       | `prefablens` CLI tool                                              |
+| `extension/` | Chrome extension for semantic diffs on GitHub pull requests        |
+| `editor/`    | Unity Editor package for semantic diffs                            |
+| `site/`      | Live demo on Cloudflare Workers, using CLI and extension artifacts |
+
+### Build and test
+
+Run the commands in each code block from the repository root.
+
+#### Core and CLI
+
+```bash
+zig build test
+zig build run -- before.prefab after.prefab
+```
+
+#### WASM
+
+Build the WASM module for the extension:
+
+```bash
+zig build wasm
+```
+
+#### Chrome extension
+
+The extension build and test commands run `zig build wasm` when needed.
+
+```bash
+(cd extension && pnpm install && pnpm run build && pnpm test)
+```
+
+#### Unity Editor
+
+These tests run on .NET and call the native CLI.
+They do not require Unity.
+
+```bash
+zig build test-installation-binaries -Doptimize=ReleaseSafe
+PREFABLENS_TEST_BIN_DIR="$PWD/zig-out/bin" \
+PREFABLENS_TEST_ALT_BIN_DIR="$PWD/zig-out/test-alternate-bin" \
+  dotnet test editor/DotNetTests~/Tests
+```
+
+#### Site
+
+Before you build the site, build the CLI, WASM module, and extension demo bundle:
+
+```bash
+zig build
+zig build wasm
+(cd extension && pnpm run demo)
+(cd site && pnpm run build)
+```
+
+### Further reading
 
 - [CLI](docs/cli.md)
 - [Chrome extension](docs/extension.md)

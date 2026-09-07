@@ -1,9 +1,9 @@
 {
   "name": "prefablens-extension",
   "private": true,
-  "version": "0.9.1",
+  "version": "0.9.2",
   "type": "module",
-  "packageManager": "pnpm@11.24.0",
+  "packageManager": "pnpm@12.1.0",
   "scripts": {
     "build": "node build.mjs",
     "demo": "node build.mjs --demo",
